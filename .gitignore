@@ -1,5 +1,6 @@
 # YILDIZ Ders Otomasyonu
 user_info*
+.ytu_session
 *.log
 *.db
 __pycache__/
