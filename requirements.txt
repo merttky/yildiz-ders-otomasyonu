@@ -1,0 +1,26 @@
+# YILDIZ Ders Otomasyonu v1.0
+# Requirements
+
+# ── Core Dependencies ────────────────────────────────────────────────────────
+
+# HTTP client for API requests
+requests>=2.31.0
+
+# HTML parsing for web scraping
+beautifulsoup4>=4.12.0
+
+# Fast HTML/XML parser for BeautifulSoup
+lxml>=4.9.0
+
+# ── Standard Library (no install needed) ─────────────────────────────────────
+# tkinter - GUI (built-in)
+# json - Data storage (built-in)
+# shelve - Credential storage (built-in)
+# datetime - Time handling (built-in)
+# threading - Background scheduler (built-in)
+# subprocess - Zoom launcher (built-in)
+# webbrowser - Fallback Zoom opener (built-in)
+# logging - Logging system (built-in)
+
+# ── Installation ─────────────────────────────────────────────────────────────
+# pip install -r requirements.txt

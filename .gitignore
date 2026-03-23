@@ -1,0 +1,25 @@
+# YILDIZ Ders Otomasyonu
+user_info*
+*.log
+*.db
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+*.spec
+
+# Test dosyaları
+test_*.json
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# MacOS
+.DS_Store
