@@ -41,6 +41,13 @@ if [ ! -d "$VENV_DIR" ]; then
     fi
     echo "[OK] Virtual environment created"
     echo ""
+
+    # Upgrade pip immediately after venv creation
+    echo "[INFO] Upgrading pip..."
+    source "$VENV_DIR/bin/activate"
+    python -m pip install --upgrade pip
+    echo "[OK] pip upgraded"
+    echo ""
 fi
 
 # Activate virtual environment
@@ -59,7 +66,6 @@ echo "Checking dependencies..."
 if ! pip show requests beautifulsoup4 lxml &> /dev/null; then
     echo ""
     echo "[INFO] Installing dependencies..."
-    pip install --upgrade pip
     pip install -r requirements.txt
     if [ $? -ne 0 ]; then
         echo "[ERROR] Failed to install dependencies"

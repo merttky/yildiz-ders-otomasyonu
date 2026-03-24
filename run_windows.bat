@@ -42,6 +42,13 @@ if not exist "%VENV_DIR%\Scripts\activate.bat" (
     )
     echo [OK] Virtual environment created
     echo.
+
+    REM Upgrade pip immediately after venv creation
+    echo [INFO] Upgrading pip...
+    call %VENV_DIR%\Scripts\activate.bat
+    python.exe -m pip install --upgrade pip
+    echo [OK] pip upgraded
+    echo.
 )
 
 REM Activate virtual environment
@@ -61,7 +68,6 @@ pip show requests beautifulsoup4 lxml >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
     echo [INFO] Installing dependencies...
-    pip install --upgrade pip
     pip install -r requirements.txt
     if %errorlevel% neq 0 (
         echo [ERROR] Failed to install dependencies
