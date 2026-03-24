@@ -17,6 +17,13 @@ import logging
 from ytu_client import YTUSessionManager, YTUClientException
 from zoom_launcher import open_zoom_link
 from config import SCHEDULE_FILE, USER_FILE, CHECK_INTERVAL, JOIN_TOLERANCE
+from discord_notifier import (
+    notify_lesson_joined,
+    notify_lesson_failed,
+    notify_scheduler_triggered,
+    notify_no_link_found,
+    test_webhook
+)
 
 # Setup logging
 logging.basicConfig(
@@ -34,6 +41,7 @@ lesson_mapping = []  # [(day, index), ...]
 joined_lessons = set()  # Prevent duplicate joins
 current_username = ""
 current_password = ""
+discord_webhook_url = ""  # Discord webhook URL for notifications
 ytu_session = None  # YTU session manager (lazy init)
 
 
@@ -70,6 +78,92 @@ def load_credentials():
             logger.info(f"Loaded credentials for: {current_username}")
     except Exception as e:
         logger.warning(f"Could not load credentials: {e}")
+
+
+# ── Discord Webhook Management ────────────────────────────────────────────────
+
+def load_webhook_url():
+    """Load saved Discord webhook URL"""
+    global discord_webhook_url
+    try:
+        with shelve.open(str(USER_FILE)) as db:
+            discord_webhook_url = db.get("discord_webhook_url", "")
+        if discord_webhook_url:
+            logger.info("Discord webhook URL loaded")
+    except Exception as e:
+        logger.warning(f"Could not load webhook URL: {e}")
+
+
+def save_webhook_url(url: str):
+    """Save Discord webhook URL"""
+    global discord_webhook_url
+    discord_webhook_url = url.strip()
+    with shelve.open(str(USER_FILE)) as db:
+        db["discord_webhook_url"] = discord_webhook_url
+    logger.info("Discord webhook URL saved")
+
+
+def open_settings_window():
+    """Open settings window for Discord webhook configuration"""
+    global discord_webhook_url
+
+    settings_window = tk.Toplevel(root)
+    settings_window.title("Ayarlar - Discord Webhook")
+    settings_window.geometry("500x200")
+    settings_window.transient(root)
+    settings_window.grab_set()
+
+    # Discord webhook section
+    tk.Label(
+        settings_window,
+        text="Discord Webhook Ayarlari",
+        font=("Arial", 12, "bold")
+    ).pack(pady=10)
+
+    tk.Label(
+        settings_window,
+        text="Ders katilim bildirimlerini Discord'a gondermek icin webhook URL'i girin.",
+        wraplength=450
+    ).pack(pady=5)
+
+    # URL entry
+    url_frame = tk.Frame(settings_window)
+    url_frame.pack(fill="x", padx=20, pady=10)
+
+    tk.Label(url_frame, text="Webhook URL:").pack(side="left")
+    url_entry = tk.Entry(url_frame, width=50)
+    url_entry.pack(side="left", padx=10, fill="x", expand=True)
+    url_entry.insert(0, discord_webhook_url)
+
+    # Buttons
+    btn_frame = tk.Frame(settings_window)
+    btn_frame.pack(pady=15)
+
+    def on_test():
+        url = url_entry.get().strip()
+        if not url:
+            messagebox.showwarning("Uyari", "Webhook URL'i giriniz!")
+            return
+
+        if test_webhook(url):
+            messagebox.showinfo("Basarili", "Test bildirimi gonderildi!\nDiscord kanalinizi kontrol edin.")
+        else:
+            messagebox.showerror("Hata", "Webhook testi basarisiz.\nURL'i kontrol edin.")
+
+    def on_save():
+        url = url_entry.get().strip()
+        save_webhook_url(url)
+        messagebox.showinfo("Bilgi", "Webhook ayarlari kaydedildi!")
+        settings_window.destroy()
+
+    def on_clear():
+        url_entry.delete(0, tk.END)
+        save_webhook_url("")
+        messagebox.showinfo("Bilgi", "Webhook devre disi birakildi.")
+
+    ttk.Button(btn_frame, text="Test Et", command=on_test, width=12).pack(side="left", padx=5)
+    ttk.Button(btn_frame, text="Kaydet", command=on_save, width=12).pack(side="left", padx=5)
+    ttk.Button(btn_frame, text="Temizle", command=on_clear, width=12).pack(side="left", padx=5)
 
 
 # ── Schedule Management ──────────────────────────────────────────────────────
@@ -215,7 +309,7 @@ def show_course_selection_dialog(courses: list):
     """
     selector_window = tk.Toplevel(root)
     selector_window.title("Ders Seçimi - YILDIZ")
-    selector_window.geometry("500x450")
+    selector_window.geometry("900x400")
     selector_window.transient(root)
 
     # Başlık
@@ -430,6 +524,65 @@ def add_course_with_time_dialog(course_data: dict):
 
 # ── Automation Core (Pure Terminal - no Selenium!) ───────────────────────────
 
+# Tolerance for "Şimdi Derse Gir" button (±15 minutes)
+MANUAL_JOIN_TOLERANCE = 15 * 60  # seconds
+
+
+def get_current_lesson() -> tuple[str, str] | None:
+    """
+    Find the current or upcoming lesson within tolerance.
+
+    Returns:
+        tuple (course_name, hour) if a lesson is found within ±15 minutes
+        None if no matching lesson
+    """
+    now = datetime.datetime.now()
+    current_day = now.strftime("%A")
+    schedule = load_schedule()
+
+    if current_day not in schedule:
+        return None
+
+    best_match = None
+    min_diff = float('inf')
+
+    for lesson in schedule[current_day]:
+        lesson_time = datetime.datetime.strptime(lesson["hour"], "%H:%M").replace(
+            year=now.year, month=now.month, day=now.day
+        )
+        diff = abs((now - lesson_time).total_seconds())
+
+        if diff <= MANUAL_JOIN_TOLERANCE and diff < min_diff:
+            min_diff = diff
+            best_match = (lesson.get('desc', ''), lesson['hour'])
+
+    return best_match
+
+
+def handle_manual_join():
+    """
+    Handler for "Şimdi Derse Gir" button.
+    Checks schedule before joining to prevent wrong class entry.
+    """
+    lesson = get_current_lesson()
+
+    if lesson is None:
+        messagebox.showwarning(
+            "Uyarı",
+            "Şu an için planlanmış ders bulunamadı!\n\n"
+            "±15 dakika tolerans içinde kayıtlı ders yok.\n"
+            "Lütfen ders programınızı kontrol edin."
+        )
+        logger.warning("[MANUAL] No scheduled lesson found within tolerance")
+        return
+
+    course_name, hour = lesson
+    logger.info(f"[MANUAL] Found scheduled lesson: {course_name} at {hour}")
+
+    # Start automation with found course name
+    threading.Thread(target=run_automation, args=(course_name,), daemon=True).start()
+
+
 def run_automation(course_name: str = None):
     """
     Pure Terminal automation - Join class without Selenium
@@ -476,6 +629,7 @@ def run_automation(course_name: str = None):
         if not zoom_url:
             messagebox.showwarning("Uyarı", "Aktif ders bulunamadı veya Zoom linki çıkarılamadı.\n\nDers saatinde olduğunuzdan emin olun.")
             logger.warning("No Zoom link found")
+            notify_no_link_found(discord_webhook_url, course_name)
             return
 
         # Step 3: Open Zoom
@@ -485,16 +639,20 @@ def run_automation(course_name: str = None):
         if success:
             messagebox.showinfo("Başarılı", "Zoom uygulaması açıldı!\n\nLütfen Zoom'da 'Join' butonuna tıklayın.")
             logger.info("✓ Automation completed successfully")
+            notify_lesson_joined(discord_webhook_url, course_name or "Bilinmeyen Ders")
         else:
             messagebox.showerror("Hata", "Zoom linki açılamadı. Zoom uygulaması yüklü mü?")
             logger.error("Failed to open Zoom")
+            notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", "Zoom acilamadi")
 
     except YTUClientException as e:
         messagebox.showerror("Hata", f"Otomasyon başarısız:\n{e}")
         logger.error(f"Automation error: {e}")
+        notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", str(e))
     except Exception as e:
         messagebox.showerror("Hata", f"Beklenmeyen hata:\n{e}")
         logger.error(f"Unexpected error: {e}", exc_info=True)
+        notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", str(e))
 
 
 # ── Scheduler ────────────────────────────────────────────────────────────────
@@ -529,8 +687,12 @@ def check_schedule():
 
                     if diff <= JOIN_TOLERANCE:
                         course_name = lesson.get('desc', '')
+                        hour = lesson['hour']
                         logger.info(f"[SCHEDULER] Time to join: {lesson_key} - {course_name} (diff: {diff:.0f}s)")
                         joined_lessons.add(lesson_key)
+
+                        # Send Discord notification
+                        notify_scheduler_triggered(discord_webhook_url, course_name, hour)
 
                         # Start automation in background thread with course name
                         threading.Thread(
@@ -608,12 +770,14 @@ ttk.Button(
 ttk.Button(
     btn_frame,
     text="Şimdi Derse Gir",
-    command=lambda: threading.Thread(target=run_automation, daemon=True).start(),
+    command=handle_manual_join,
     width=22,
     style="Blue.TButton"
 ).pack(pady=2)
 
 ttk.Button(btn_frame, text="Seçili Dersi Sil", command=delete_lesson, width=22).pack(pady=2)
+
+ttk.Button(btn_frame, text="Ayarlar (Webhook)", command=open_settings_window, width=22).pack(pady=2)
 
 # Lesson list
 tk.Label(root, text="Kayıtlı Dersler:").grid(row=10, column=0, columnspan=2, pady=(10, 0))
@@ -634,6 +798,7 @@ logger.info("=== YILDIZ Ders Otomasyonu v1.0 ===")
 logger.info("Mode: Selenium-free, API-based")
 
 load_credentials()
+load_webhook_url()
 update_lesson_list()
 
 # Start scheduler thread

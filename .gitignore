@@ -12,6 +12,7 @@ venv/
 dist/
 build/
 *.spec
+schedule.json
 
 # Test dosyaları
 test_*.json
