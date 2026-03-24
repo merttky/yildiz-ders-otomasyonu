@@ -83,6 +83,7 @@ config.py            - Yapılandırma ayarları
 run_macos.command    - macOS başlatıcı
 run_windows.bat      - Windows başlatıcı
 schedule.json        - Ders programı (otomatik oluşur)
+discord_notifier.py  - Discord Webhook bildirimi gönderir
 ```
 
 ## Lisans
