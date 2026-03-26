@@ -30,6 +30,10 @@ SESSION_LIFETIME = 7200  # 2 hours (7200 seconds)
 CHECK_INTERVAL = 20  # Check every 20 seconds
 JOIN_TOLERANCE = 30   # Join if within ±30 seconds of class time
 
+# ── Manual Join ("Şimdi Derse Gir") Settings ────────────────────────────────
+MANUAL_JOIN_BEFORE = 15 * 60  # 15 minutes before class (900 seconds)
+MANUAL_JOIN_AFTER = 60 * 60   # 60 minutes after class starts (3600 seconds)
+
 # ── Retry Settings ───────────────────────────────────────────────────────────
 MAX_RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2  # seconds between retries

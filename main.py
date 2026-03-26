@@ -16,7 +16,7 @@ import logging
 # ── Core modules (Pure Terminal) ─────────────────────────────────────────────
 from ytu_client import YTUSessionManager, YTUClientException
 from zoom_launcher import open_zoom_link
-from config import SCHEDULE_FILE, USER_FILE, CHECK_INTERVAL, JOIN_TOLERANCE
+from config import SCHEDULE_FILE, USER_FILE, CHECK_INTERVAL, JOIN_TOLERANCE, MANUAL_JOIN_BEFORE, MANUAL_JOIN_AFTER
 from discord_notifier import (
     notify_lesson_joined,
     notify_lesson_failed,
@@ -524,16 +524,15 @@ def add_course_with_time_dialog(course_data: dict):
 
 # ── Automation Core (Pure Terminal - no Selenium!) ───────────────────────────
 
-# Tolerance for "Şimdi Derse Gir" button (±15 minutes)
-MANUAL_JOIN_TOLERANCE = 15 * 60  # seconds
-
 
 def get_current_lesson() -> tuple[str, str] | None:
     """
     Find the current or upcoming lesson within tolerance.
 
     Returns:
-        tuple (course_name, hour) if a lesson is found within ±15 minutes
+        tuple (course_name, hour) if a lesson is found within tolerance:
+        - 15 minutes before class start
+        - 60 minutes after class starts
         None if no matching lesson
     """
     now = datetime.datetime.now()
@@ -550,11 +549,16 @@ def get_current_lesson() -> tuple[str, str] | None:
         lesson_time = datetime.datetime.strptime(lesson["hour"], "%H:%M").replace(
             year=now.year, month=now.month, day=now.day
         )
-        diff = abs((now - lesson_time).total_seconds())
+        # Time until lesson starts (negative = lesson in the future)
+        time_until_lesson = (lesson_time - now).total_seconds()
 
-        if diff <= MANUAL_JOIN_TOLERANCE and diff < min_diff:
-            min_diff = diff
-            best_match = (lesson.get('desc', ''), lesson['hour'])
+        # Valid window: 15 min before to 60 min after class starts
+        if -MANUAL_JOIN_BEFORE <= time_until_lesson <= MANUAL_JOIN_AFTER:
+            # Use absolute time in window for best match
+            abs_diff = abs(time_until_lesson)
+            if abs_diff < min_diff:
+                min_diff = abs_diff
+                best_match = (lesson.get('desc', ''), lesson['hour'])
 
     return best_match
 
@@ -563,14 +567,15 @@ def handle_manual_join():
     """
     Handler for "Şimdi Derse Gir" button.
     Checks schedule before joining to prevent wrong class entry.
+    Tolerance: 15 minutes before to 60 minutes after class starts.
     """
     lesson = get_current_lesson()
 
     if lesson is None:
         messagebox.showwarning(
             "Uyarı",
-            "Şu an için planlanmış ders bulunamadı!\n\n"
-            "±15 dakika tolerans içinde kayıtlı ders yok.\n"
+            "Uygun ders bulunamadı!\n\n"
+            "Tolerans: Dersten 15 dakika önce ~ Dersten 60 dakika sonrası\n"
             "Lütfen ders programınızı kontrol edin."
         )
         logger.warning("[MANUAL] No scheduled lesson found within tolerance")
