@@ -552,8 +552,8 @@ def get_current_lesson() -> tuple[str, str] | None:
         # Time until lesson starts (negative = lesson in the future)
         time_until_lesson = (lesson_time - now).total_seconds()
 
-        # Valid window: 15 min before to 60 min after class starts
-        if -MANUAL_JOIN_BEFORE <= time_until_lesson <= MANUAL_JOIN_AFTER:
+        # Valid window: 60 min after to 15 min before class starts
+        if -MANUAL_JOIN_AFTER <= time_until_lesson <= MANUAL_JOIN_BEFORE:
             # Use absolute time in window for best match
             abs_diff = abs(time_until_lesson)
             if abs_diff < min_diff:
