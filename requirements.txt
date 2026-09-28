@@ -6,6 +6,9 @@
 # HTTP client for API requests
 requests>=2.31.0
 
+# Imported directly for custom SSL context handling
+urllib3>=2.0.0
+
 # HTML parsing for web scraping
 beautifulsoup4>=4.12.0
 

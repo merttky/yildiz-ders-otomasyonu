@@ -29,11 +29,32 @@ Yıldız Teknik Üniversitesi online derslerine otomatik katılım sağlayan haf
 
 Veya Finder'da `run_macos.command` dosyasına çift tıklayın.
 
+Ek seçenekler:
+
+```bash
+./run_macos.command --recreate-venv   # Sanal ortamı silip yeniden oluştur
+./run_macos.command --install-only    # Sadece kurulum yap, uygulamayı çalıştırma
+./run_macos.command --help            # Yardım
+```
+
 ### Windows
 
-`run_windows.bat` dosyasına çift tıklayın.
+`run_windows.bat` dosyasına çift tıklayın (aynı seçenekler geçerlidir).
 
 > **Not:** İlk çalıştırmada otomatik olarak virtual environment oluşturulur ve bağımlılıklar yüklenir.
+>
+> **İpucu:** Proje klasörünü taşırsanız `venv` klasörü eski yolu gösterir. Bu durumda başlatıcı
+> bozuk sanal ortamı otomatik algılar ve yeniden oluşturur. Elle düzeltmek isterseniz:
+>
+> ```bash
+> rm -rf venv && ./run_macos.command
+> ```
+
+### Başlatıcılar nasıl çalışır?
+
+Başlatıcılar sanal ortamı `activate` ile etkinleştirmez; doğrudan `venv` içindeki Python'u
+çağırır (`python -m pip`). Böylece proje klasörü taşındığında veya sistemde `pip` komutu
+bulunmadığında sorun yaşanmaz.
 
 ## Kullanım
 
@@ -72,6 +93,9 @@ Uygulama açık kaldığı sürece arka planda çalışır. Ders saati geldiğin
 | "Login başarısız" | Kullanıcı adı/şifre kontrol edin |
 | "Ders bulunamadı" | Ders saatinde olduğunuzdan emin olun |
 | Zoom açılmıyor | Zoom Desktop yüklü mü kontrol edin |
+| `pip: command not found` | `./run_macos.command --recreate-venv` (venv bozuk/eski) |
+| `No module named tkinter` | macOS: `brew install python-tk` |
+| Python 3.8+ bulunamadı | `brew install python` veya python.org kurulumu |
 
 ## Dosya Yapısı
 
