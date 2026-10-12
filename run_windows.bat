@@ -55,7 +55,7 @@ REM ------------------------------------------------------------
 cd /d "%~dp0"
 if errorlevel 1 (
     echo [HATA] Proje klasorune gecilemedi.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo [INFO] Proje klasoru: %CD%
@@ -82,7 +82,7 @@ echo veya https://www.python.org/downloads/
 echo.
 echo Kurulumda "Add python.exe to PATH" secenegini isaretlemeyi unutmayin.
 echo.
-pause
+if not defined CI pause
 exit /b 1
 
 :python_found
@@ -98,12 +98,12 @@ if errorlevel 1 (
 
 if not exist "%REQUIREMENTS%" (
     echo [HATA] requirements.txt bulunamadi.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 if not exist "%MAIN_SCRIPT%" (
     echo [HATA] main.py bulunamadi.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -136,7 +136,7 @@ if exist "%VENV_DIR%\pyvenv.cfg" goto do_remove
 if exist "%VENV_DIR%\Scripts\activate.bat" goto do_remove
 echo [HATA] '%VENV_DIR%' bir sanal ortam gibi gorunmuyor; guvenlik icin silinmedi.
 echo [HATA] Lutfen klasoru elle kontrol edin veya silin.
-pause
+if not defined CI pause
 exit /b 1
 
 :do_remove
@@ -154,7 +154,7 @@ if errorlevel 1 (
     echo   - Python'u "pip" ve "venv" bilesenleriyle birlikte kurun
     echo   - Proje klasorunu Program Files gibi yazma korumali yere tasimayin
     echo.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo [OK] Sanal ortam olusturuldu
@@ -168,7 +168,7 @@ goto pip_check
 
 :venv_unhealthy
 echo [HATA] Sanal ortam saglikli degil: %VENV_PY%
-pause
+if not defined CI pause
 exit /b 1
 
 REM Sanal ortam icinde pip yoksa ensurepip ile kur.
@@ -179,7 +179,7 @@ echo [UYARI] Sanal ortam icinde pip bulunamadi; ensurepip calistiriliyor...
 "%VENV_PY%" -m ensurepip --upgrade >nul 2>&1
 if not errorlevel 1 goto deps_check
 echo [HATA] pip kurulamadi. '%VENV_DIR%' klasorunu silip tekrar deneyin.
-pause
+if not defined CI pause
 exit /b 1
 
 REM ------------------------------------------------------------
@@ -188,7 +188,7 @@ REM      "pip show" yerine gercek import denemesi kullanilir.
 REM ------------------------------------------------------------
 :deps_check
 echo [INFO] Bagimliliklar kontrol ediliyor...
-"%VENV_PY%" -c "import requests, bs4, lxml, urllib3" >nul 2>&1
+"%VENV_PY%" -c "import requests, bs4, lxml, urllib3, keyring" >nul 2>&1
 if not errorlevel 1 (
     echo [OK] Bagimliliklar hazir
     goto deps_done
@@ -201,15 +201,15 @@ if errorlevel 1 echo [UYARI] pip guncellemesi basarisiz oldu, kuruluma devam edi
 "%VENV_PY%" -m pip install -r "%REQUIREMENTS%"
 if errorlevel 1 (
     echo [HATA] Bagimliliklar kurulamadi. Internet baglantinizi kontrol edin.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
-"%VENV_PY%" -c "import requests, bs4, lxml, urllib3" >nul 2>&1
+"%VENV_PY%" -c "import requests, bs4, lxml, urllib3, keyring" >nul 2>&1
 if errorlevel 1 (
     echo [HATA] Bagimliliklar kuruldu ama yuklenemiyor.
     echo [HATA] '%VENV_DIR%' klasorunu silip tekrar deneyin.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo [OK] Bagimliliklar kuruldu
@@ -217,7 +217,7 @@ echo [OK] Bagimliliklar kuruldu
 :deps_done
 if "%INSTALL_ONLY%"=="1" (
     echo [OK] Kurulum tamamlandi.
-    pause
+    if not defined CI pause
     exit /b 0
 )
 
@@ -234,7 +234,7 @@ set "EXIT_CODE=%errorlevel%"
 if not "%EXIT_CODE%"=="0" (
     echo.
     echo [HATA] Program hata koduyla sonlandi: %EXIT_CODE%
-    pause
+    if not defined CI pause
 )
 
 exit /b %EXIT_CODE%

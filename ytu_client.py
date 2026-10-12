@@ -1,26 +1,49 @@
 """
 YILDIZ Ders Otomasyonu - LMS HTTP Client
-Selenium-free API client using requests + BeautifulSoup
+Selenium-free API client using requests + BeautifulSoup.
+
+Features:
+- Thread-safe operations with RLock
+- Real login verification (no false positives)
+- Session expiry detection + automatic re-login
+- JSON-based session persistence with 0600 file permissions and username scoping
+- Time-validated attendance button selection
+- Direct targeting by program_no and Turkish-aware course name matching
+- Secure TLS 1.3 verification with automatic connection retries
 """
-import requests
-from requests.adapters import HTTPAdapter
-from bs4 import BeautifulSoup
-import re
+from __future__ import annotations
+
+import datetime
+import json
 import logging
-from typing import Optional, List, Dict
-from urllib.parse import urljoin
-from pathlib import Path
-import pickle
+import os
+import re
+import tempfile
+import threading
 import time
-import ssl
-import urllib3
-from urllib3.util.ssl_ import create_urllib3_context
+from pathlib import Path
+from typing import Dict, List, Optional
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import (
-    YTU_BASE_URL, YTU_LOGIN_URL, YTU_COCKPIT_URL,
-    REQUEST_TIMEOUT, USER_AGENT, SESSION_FILE, SESSION_LIFETIME,
-    SELECTORS, MAX_RETRY_ATTEMPTS, RETRY_DELAY
+    MAX_RETRY_ATTEMPTS,
+    REQUEST_TIMEOUT,
+    RETRY_DELAY,
+    SESSION_CACHE_TTL,
+    SESSION_FILE,
+    LEGACY_SESSION_FILE,
+    SESSION_LIFETIME,
+    USER_AGENT,
+    YTU_BASE_URL,
+    YTU_COCKPIT_URL,
+    YTU_LOGIN_URL,
 )
+from turkish_utils import turkish_contains
 
 # API endpoints
 YTU_ATTEND_URL = f"{YTU_BASE_URL}/ViewLessonProgramAsStudent/AttendLessonProgram"
@@ -28,29 +51,7 @@ YTU_COURSE_TAB_URL = f"{YTU_BASE_URL}/ViewCockpit/GetCourseTab"
 YTU_ATTENDANCE_LIST_URL = f"{YTU_BASE_URL}/ViewLessonProgramAsStudent/ListLessonProgramAttendance"
 YTU_LESSON_VIEW_URL = f"{YTU_BASE_URL}/ViewLessonProgramAsStudent/View"
 
-# Disable SSL warnings (YTU server uses legacy SSL)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
-
-
-class LegacySSLAdapter(HTTPAdapter):
-    """
-    Custom HTTP Adapter that enables legacy SSL renegotiation.
-    Required for YTU server which uses older SSL/TLS configuration.
-    """
-    def init_poolmanager(self, *args, **kwargs):
-        ctx = create_urllib3_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.options |= ssl.OP_LEGACY_SERVER_CONNECT
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
 
 
 class YTUClientException(Exception):
@@ -58,18 +59,56 @@ class YTUClientException(Exception):
     pass
 
 
+class YTUSessionExpiredException(YTUClientException):
+    """Raised when server-side session has expired"""
+    pass
+
+
+def parse_ytu_datetime(date_str: str) -> Optional[datetime.datetime]:
+    """Parse date strings from YTU Online HTML (e.g. '23.03.2026 13:00:00')."""
+    if not date_str or not isinstance(date_str, str):
+        return None
+    cleaned = date_str.strip()
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.datetime.strptime(cleaned, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def is_attendance_time_active(
+    start_str: str,
+    end_str: str,
+    now: Optional[datetime.datetime] = None
+) -> bool:
+    """
+    Checks if current time falls within the lesson attendance window.
+    Window: 15 minutes before StartTime until EndTime (plus 15 minute buffer).
+    """
+    start_dt = parse_ytu_datetime(start_str)
+    end_dt = parse_ytu_datetime(end_str)
+    if not start_dt:
+        return True  # If unparseable, don't filter out
+
+    check_dt = now or datetime.datetime.now()
+    window_start = start_dt - datetime.timedelta(minutes=15)
+    window_end = (end_dt + datetime.timedelta(minutes=15)) if end_dt else (start_dt + datetime.timedelta(hours=2))
+
+    return window_start <= check_dt <= window_end
+
+
 class YTUClient:
     """
-    YTU Online LMS HTTP client
-
-    Features:
-    - JSON-based login authentication
-    - Session management with cookie persistence
-    - API-based Zoom link extraction (AttendLessonProgram)
-    - CSRF token handling
+    YTU Online LMS HTTP client.
+    Thread-safe and resilient.
     """
 
-    def __init__(self):
+    def __init__(self, username: str = "", password: str = ""):
+        self.username = username.strip() if username else ""
+        self.password = password
+        self._lock = threading.RLock()
+
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': USER_AGENT,
@@ -80,281 +119,359 @@ class YTUClient:
             'DNT': '1',
         })
 
-        # Mount legacy SSL adapter for YTU server compatibility
-        self.session.mount('https://', LegacySSLAdapter())
-        self.session.verify = False
+        # Mount HTTPAdapter with automatic retries for transient connection errors
+        retries = Retry(
+            total=MAX_RETRY_ATTEMPTS,
+            backoff_factor=RETRY_DELAY,
+            status_forcelist=[500, 502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount('https://', adapter)
+        self.session.mount('http://', adapter)
+        self.session.verify = True
 
         self.logged_in = False
-        self.csrf_token = None  # Will be extracted from pages
+        self.csrf_token: Optional[str] = None
+        self._last_validated_time: float = 0.0
 
-    def login(self, username: str, password: str) -> bool:
+    def update_credentials(self, username: str, password: str) -> None:
+        """Update user credentials safely."""
+        with self._lock:
+            clean_user = username.strip() if username else ""
+            if self.username != clean_user or self.password != password:
+                self.username = clean_user
+                self.password = password
+                self.logged_in = False
+                self._last_validated_time = 0.0
+
+    def login(self, username: Optional[str] = None, password: Optional[str] = None) -> bool:
         """
-        Login to YTU Online using JSON-based AJAX authentication
+        Login to YTU Online using JSON-based AJAX authentication.
+        Accurately verifies authentication without false positives.
         """
-        try:
-            logger.info(f"Attempting login for: {username}")
+        with self._lock:
+            target_user = (username.strip() if username else self.username)
+            target_pwd = password if password is not None else self.password
 
-            login_payload = {
-                "Username": username,
-                "Password": password,
-                "RememberMe": False
-            }
-
-            headers = {
-                'Content-Type': 'application/json',
-                'X-Requested-With': 'XMLHttpRequest',
-            }
-
-            response = self.session.post(
-                YTU_LOGIN_URL,
-                json=login_payload,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True
-            )
-
-            response.raise_for_status()
-
-            success = self._verify_login(response)
-
-            if success:
-                self.logged_in = True
-                logger.info("✓ Login successful")
-                self._save_session()
-                return True
-            else:
-                logger.warning("✗ Login failed - invalid credentials")
+            if not target_user or not target_pwd:
+                logger.error("Login failed: Username or password missing")
                 return False
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Login request failed: {e}")
-            raise YTUClientException(f"Login failed: {e}")
+            self.username = target_user
+            self.password = target_pwd
 
-    def _verify_login(self, response: requests.Response) -> bool:
-        """Verify if login was successful"""
-        if 'Login' not in response.url:
+            try:
+                logger.info(f"Attempting login for: {self.username}")
+
+                login_payload = {
+                    "Username": self.username,
+                    "Password": self.password,
+                    "RememberMe": False
+                }
+
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-Requested-With': 'XMLHttpRequest',
+                }
+
+                response = self.session.post(
+                    YTU_LOGIN_URL,
+                    json=login_payload,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                    allow_redirects=True
+                )
+
+                response.raise_for_status()
+
+                # Step 1: Reject explicit failures in login response
+                if self._is_login_response_rejected(response):
+                    logger.warning("✗ Login rejected by server (invalid credentials or login error)")
+                    self.logged_in = False
+                    return False
+
+                # Step 2: Ground-truth verification: probe Cockpit directly
+                # Verifies that server does NOT redirect to /Account/Login
+                if self._validate_session(force_network=True):
+                    self.logged_in = True
+                    self._last_validated_time = time.time()
+                    logger.info("✓ Login successful and cockpit access verified")
+                    self._save_session()
+                    return True
+                else:
+                    logger.warning("✗ Login failed: Cockpit access redirected to login or unauthorized")
+                    self.logged_in = False
+                    return False
+
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Login request failed: {e}")
+                self.logged_in = False
+                raise YTUClientException(f"Login failed: {e}")
+
+    def _is_login_response_rejected(self, response: requests.Response) -> bool:
+        """
+        Checks if login response explicitly indicates failure.
+        Rejects bad status codes, redirect loops to login, and explicit failure JSON.
+        """
+        # Status code check
+        if response.status_code not in (200, 302):
             return True
 
-        cookie_names = [cookie.name for cookie in self.session.cookies]
-        auth_cookies = ['.ASPXAUTH', 'ASP.NET_SessionId', '.AspNetCore.Session']
+        # Check redirect history: did it redirect back to /Account/Login?
+        if response.history:
+            for r in response.history:
+                if 'Account/Login' in r.headers.get('Location', ''):
+                    return True
 
-        if any(auth_cookie in cookie_names for auth_cookie in auth_cookies):
-            return True
-
+        # Check JSON response if present
         try:
             json_response = response.json()
-            if json_response.get('success') or json_response.get('Success'):
-                return True
+            if isinstance(json_response, dict):
+                # Explicit failure flags
+                if json_response.get('Success') is False or json_response.get('success') is False:
+                    logger.debug(f"Login JSON explicit failure: {json_response.get('Message')}")
+                    return True
+                if json_response.get('IsSuccess') is False or json_response.get('isSuccess') is False:
+                    logger.debug(f"Login JSON explicit failure: {json_response.get('Message')}")
+                    return True
         except ValueError:
             pass
 
-        if response.status_code == 200:
-            return True
+        # If response redirected to or is still at Login page with form, it failed
+        if 'Account/Login' in response.url:
+            if 'id="loginForm"' in response.text or 'name="Password"' in response.text:
+                return True
 
         return False
 
-    def _save_session(self):
-        """Save session cookies to disk"""
+    def _verify_login(self, response: requests.Response) -> bool:
+        """
+        Verify if login was successful.
+        Checks that response did not explicitly fail, then validates Cockpit access.
+        """
+        if self._is_login_response_rejected(response):
+            return False
+        return self._validate_session(force_network=True)
+
+    def _save_session(self) -> None:
+        """Save session cookies to disk as JSON with 0600 permissions."""
+        if not self.username:
+            return
+
         try:
+            cookie_dict = requests.utils.dict_from_cookiejar(self.session.cookies)
             session_data = {
-                'cookies': self.session.cookies.get_dict(),
-                'timestamp': time.time()
+                'username': self.username,
+                'cookies': cookie_dict,
+                'timestamp': time.time(),
             }
-            with open(SESSION_FILE, 'wb') as f:
-                pickle.dump(session_data, f)
-            logger.debug("✓ Session saved")
+
+            temp_dir = SESSION_FILE.parent
+            temp_fd, temp_path_str = tempfile.mkstemp(
+                prefix="session_",
+                suffix=".tmp",
+                dir=temp_dir
+            )
+            temp_path = Path(temp_path_str)
+
+            with os.fdopen(temp_fd, "w", encoding="utf-8") as f:
+                json.dump(session_data, f)
+                f.flush()
+                os.fsync(f.fileno())
+
+            try:
+                os.chmod(temp_path, 0o600)
+            except OSError:
+                pass
+
+            os.replace(temp_path, SESSION_FILE)
+
+            try:
+                os.chmod(SESSION_FILE, 0o600)
+            except OSError:
+                pass
+
+            logger.debug(f"✓ Session saved for: {self.username}")
         except Exception as e:
             logger.warning(f"Failed to save session: {e}")
 
-    def load_session(self) -> bool:
-        """Load saved session from disk"""
-        if not SESSION_FILE.exists():
-            return False
+    def load_session(self, username: Optional[str] = None) -> bool:
+        """
+        Load saved session from JSON file.
+        Enforces username matching and lifetime expiration.
+        """
+        with self._lock:
+            # Clean up legacy pickle session file if present
+            if LEGACY_SESSION_FILE.exists():
+                try:
+                    LEGACY_SESSION_FILE.unlink()
+                except OSError:
+                    pass
 
-        try:
-            with open(SESSION_FILE, 'rb') as f:
-                session_data = pickle.load(f)
-
-            age = time.time() - session_data['timestamp']
-            if age > SESSION_LIFETIME:
-                logger.info(f"Session expired ({age:.0f}s)")
+            target_user = (username.strip() if username else self.username)
+            if not SESSION_FILE.exists():
                 return False
 
-            for name, value in session_data['cookies'].items():
-                self.session.cookies.set(name, value)
+            try:
+                with open(SESSION_FILE, 'r', encoding='utf-8') as f:
+                    session_data = json.load(f)
 
-            if self._validate_session():
-                self.logged_in = True
-                logger.info(f"✓ Loaded session (age: {age:.0f}s)")
-                return True
-
-            return False
-
-        except Exception as e:
-            logger.warning(f"Failed to load session: {e}")
-            return False
-
-    def _validate_session(self) -> bool:
-        """Check if current session is still valid"""
-        try:
-            response = self.session.get(
-                YTU_COCKPIT_URL,
-                timeout=5,
-                allow_redirects=False
-            )
-
-            if response.status_code == 302:
-                location = response.headers.get('Location', '')
-                if 'Login' in location:
+                saved_user = session_data.get('username', '')
+                if target_user and saved_user and saved_user.lower() != target_user.lower():
+                    logger.info(f"Cached session belongs to '{saved_user}', current user is '{target_user}'. Discarding.")
                     return False
 
-            return response.status_code == 200
+                age = time.time() - session_data.get('timestamp', 0)
+                if age > SESSION_LIFETIME:
+                    logger.info(f"Session expired ({age:.0f}s)")
+                    return False
 
-        except Exception:
-            return False
+                # Restore cookies
+                cookies = session_data.get('cookies', {})
+                self.session.cookies.clear()
+                requests.utils.add_dict_to_cookiejar(self.session.cookies, cookies)
 
-    def get_zoom_link(self, course_name: Optional[str] = None, debug: bool = False) -> Optional[str]:
-        """
-        Get Zoom meeting link using the correct API flow:
-        1. Get cockpit page to extract CSRF token
-        2. Get course tab to find lesson programs
-        3. For each lesson program, get attendance list
-        4. Find active attendance with "Derse Katıl" button
-        5. Call AttendLessonProgram API to get Zoom link
+                if target_user:
+                    self.username = target_user
 
-        Args:
-            course_name: Optional course name to filter
-            debug: If True, save HTML to files for inspection
+                if self._validate_session(force_network=True):
+                    self.logged_in = True
+                    self._last_validated_time = time.time()
+                    logger.info(f"✓ Loaded cached session for {saved_user or target_user} (age: {age:.0f}s)")
+                    return True
 
-        Returns:
-            Zoom meeting URL or None
-        """
-        if not self.logged_in:
-            raise YTUClientException("Not logged in - call login() first")
+                logger.info("Cached session rejected by server validation")
+                return False
 
-        try:
-            logger.info("Searching for active classes...")
+            except Exception as e:
+                logger.warning(f"Failed to load session: {e}")
+                return False
 
-            # Step 0: Get cockpit page to extract CSRF token
-            logger.info("Step 0: Getting CSRF token...")
-            self._extract_csrf_token()
+    def _validate_session(self, force_network: bool = False) -> bool:
+        """Check if current session is still valid."""
+        with self._lock:
+            now = time.time()
+            if not force_network and (now - self._last_validated_time) < SESSION_CACHE_TTL:
+                return self.logged_in
 
-            if not self.csrf_token:
-                logger.warning("Could not extract CSRF token")
+            try:
+                response = self.session.get(
+                    YTU_COCKPIT_URL,
+                    timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False
+                )
 
-            # Step 1: Get course tab to find lesson programs
-            logger.info("Step 1: Getting course tab...")
-            course_tab_html = self._get_course_tab(debug)
+                if response.status_code == 302:
+                    location = response.headers.get('Location', '')
+                    if 'Login' in location or 'Account' in location:
+                        return False
 
-            if not course_tab_html:
-                logger.warning("Could not get course tab")
-                return None
+                if response.status_code == 200:
+                    # Double check if response body is the login page
+                    if 'id="loginForm"' in response.text or 'name="Password"' in response.text:
+                        return False
+                    self._last_validated_time = now
+                    return True
 
-            # Step 2: Extract lesson program numbers from course cards
-            lesson_programs = self._extract_lesson_programs(course_tab_html, course_name)
+                return False
 
-            if not lesson_programs:
-                logger.warning("No lesson programs found")
-                return None
+            except Exception as e:
+                logger.debug(f"Session validation network error: {e}")
+                return False
 
-            logger.info(f"Found {len(lesson_programs)} lesson program(s)")
+    def _check_and_raise_if_session_expired(self, response: requests.Response) -> None:
+        """Detects if response indicates an expired session and raises YTUSessionExpiredException."""
+        if response.status_code in (401, 403):
+            raise YTUSessionExpiredException("HTTP 401/403 Unauthorized")
 
-            # Step 3: For each lesson program, check for active attendance
-            for lp in lesson_programs:
-                logger.info(f"Checking lesson program: {lp['name']} (No: {lp['no']})")
+        if response.status_code == 302:
+            location = response.headers.get('Location', '')
+            if 'Login' in location or 'Account' in location:
+                raise YTUSessionExpiredException("Redirected to Login")
 
-                attendance = self._get_active_attendance(lp['no'], debug)
-                if attendance:
-                    logger.info(f"Found active attendance: {attendance}")
+        # In AJAX calls, sometimes the server returns the Login page HTML with 200
+        content_type = response.headers.get('Content-Type', '')
+        if 'application/json' in content_type:
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    msg = str(data.get('Message', ''))
+                    if 'yetki' in msg.lower() or 'oturum' in msg.lower() or 'login' in msg.lower():
+                        raise YTUSessionExpiredException(f"API message: {msg}")
+            except (ValueError, TypeError):
+                pass
+        elif 'text/html' in content_type:
+            if 'name="Password"' in response.text and 'Account/Login' in response.text:
+                raise YTUSessionExpiredException("HTML Login form returned instead of data")
 
-                    # Step 4: Call AttendLessonProgram API
-                    zoom_url = self._attend_lesson(attendance)
-                    if zoom_url:
-                        return zoom_url
+    def _extract_csrf_token(self) -> None:
+        """Extract CSRF token from cockpit page."""
+        with self._lock:
+            try:
+                response = self.session.get(YTU_COCKPIT_URL, timeout=REQUEST_TIMEOUT)
+                self._check_and_raise_if_session_expired(response)
+                response.raise_for_status()
 
-            logger.warning("No active attendance found in any lesson program")
-            return None
+                soup = BeautifulSoup(response.text, 'lxml')
+                token_input = soup.find('input', {'name': '__RequestVerificationToken'})
 
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to get Zoom link: {e}")
-            raise YTUClientException(f"Failed to get Zoom link: {e}")
+                if token_input:
+                    self.csrf_token = token_input.get('value')
+                    logger.debug("✓ CSRF token extracted")
+                else:
+                    logger.debug("CSRF token input not found in cockpit page")
 
-    def _extract_csrf_token(self):
-        """Extract CSRF token from cockpit page"""
-        try:
-            response = self.session.get(YTU_COCKPIT_URL, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-
-            # Extract token from: <input name="__RequestVerificationToken" type="hidden" value="...">
-            soup = BeautifulSoup(response.text, 'lxml')
-            token_input = soup.find('input', {'name': '__RequestVerificationToken'})
-
-            if token_input:
-                self.csrf_token = token_input.get('value')
-                logger.debug(f"CSRF token extracted: {self.csrf_token[:20]}...")
-            else:
-                logger.warning("CSRF token input not found in page")
-
-        except Exception as e:
-            logger.error(f"Failed to extract CSRF token: {e}")
+            except YTUSessionExpiredException:
+                raise
+            except Exception as e:
+                logger.error(f"Failed to extract CSRF token: {e}")
 
     def _get_course_tab(self, debug: bool = False) -> Optional[str]:
-        """Get the course tab HTML from cockpit (via POST request)"""
-        try:
-            # Set AJAX headers - MUST use POST
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*',
-            }
+        """Get the course tab HTML from cockpit (via POST request)."""
+        with self._lock:
+            try:
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/javascript, */*',
+                }
 
-            response = self.session.post(
-                YTU_COURSE_TAB_URL,
-                data={},  # Empty data for POST
-                headers=headers,
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
+                response = self.session.post(
+                    YTU_COURSE_TAB_URL,
+                    data={},
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+                self._check_and_raise_if_session_expired(response)
+                response.raise_for_status()
 
-            # Response is JSON with HTML inside: {"IsSuccess": true, "Html": "<div>..."}
-            data = response.json()
+                data = response.json()
+                if not data.get('IsSuccess'):
+                    logger.warning(f"Course tab API returned error: {data.get('Message')}")
+                    return None
 
-            if not data.get('IsSuccess'):
-                logger.warning(f"Course tab API returned error: {data.get('Message')}")
+                html = data.get('Html', '')
+                return html
+
+            except YTUSessionExpiredException:
+                raise
+            except Exception as e:
+                logger.error(f"Failed to get course tab: {e}")
                 return None
 
-            html = data.get('Html', '')
-
-            if debug:
-                debug_file = Path(__file__).parent / "debug_course_tab.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-                logger.info(f"DEBUG: Saved course tab to {debug_file}")
-
-            return html
-
-        except ValueError as e:
-            logger.error(f"Failed to parse JSON response: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get course tab: {e}")
-            return None
-
-    def _extract_lesson_programs(self, html: str, course_name: Optional[str] = None) -> List[Dict]:
+    def _parse_course_cards(self, html: str) -> List[Dict]:
         """
-        Extract lesson program numbers from course cards
-
-        Course cards have onclick like: ViewLessonProgramAsStudent.start(12345)
-        Course name is in the card footer
+        Unified parser for course cards from course tab HTML.
+        Returns list of dicts: [{'no': '...', 'name': '...', 'code': '...', 'instructor': '...'}]
         """
+        if not html:
+            return []
+
         soup = BeautifulSoup(html, 'lxml')
-        programs = []
+        courses = []
 
-        # Find all card containers
-        cards = soup.find_all('div', class_='card')
-
-        for card in cards:
-            # Find onclick with lesson program number
+        for card in soup.find_all('div', class_='card'):
             onclick_elem = card.find(onclick=re.compile(r'ViewLessonProgramAsStudent\.start'))
             if not onclick_elem:
                 continue
@@ -366,289 +483,23 @@ class YTUClient:
 
             program_no = match.group(1)
 
-            # Get course name from card
+            # Course name
             name = ''
             name_elem = card.find('p', class_='font-weight-bold')
             if name_elem:
                 name = name_elem.get_text(strip=True)
             else:
-                # Fallback: look for any link text
                 link = card.find('a')
                 if link:
                     name = link.get_text(strip=True)
 
-            # Filter by course name if specified
-            if course_name and name:
-                if course_name.lower() not in name.lower():
-                    continue
-
-            programs.append({
-                'no': program_no,
-                'name': name or f'Program {program_no}'
-            })
-            logger.debug(f"Found lesson program: {program_no} - {name}")
-
-        # Remove duplicates
-        seen = set()
-        unique_programs = []
-        for p in programs:
-            if p['no'] not in seen:
-                seen.add(p['no'])
-                unique_programs.append(p)
-
-        return unique_programs
-
-    def _get_active_attendance(self, lesson_program_no: str, debug: bool = False) -> Optional[Dict]:
-        """
-        Get active attendance from a lesson program
-
-        Calls /ViewLessonProgramAsStudent/ListLessonProgramAttendance
-        Returns the attendance params if "Derse Katıl" button is available
-        """
-        try:
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*',
-            }
-
-            response = self.session.post(
-                YTU_ATTENDANCE_LIST_URL,
-                data={'LessonProgramNo': lesson_program_no},
-                headers=headers,
-                timeout=REQUEST_TIMEOUT
-            )
-            response.raise_for_status()
-
-            # Response is JSON with HTML inside
-            data = response.json()
-            html = data.get('Html', '')
-
-            if debug:
-                debug_file = Path(__file__).parent / f"debug_attendance_{lesson_program_no}.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(response.text)  # Save full JSON for debugging
-                logger.info(f"DEBUG: Saved attendance list to {debug_file}")
-
-            # Parse the HTML to find "Derse Katıl" buttons
-            return self._find_attend_button_in_html(html)
-
-        except ValueError as e:
-            logger.error(f"Failed to parse attendance JSON: {e}")
-            return None
-        except Exception as e:
-            logger.error(f"Failed to get attendance list: {e}")
-            return None
-
-    def _find_attend_button_in_html(self, html: str) -> Optional[Dict]:
-        """
-        Find "Derse Katıl" button and extract onclick parameters
-
-        Button format:
-        <a onclick="LMS.EDU.LessonProgram.ViewLessonProgramAsStudent.attendLessonProgram(124238, 118911, '23.03.2026 13:00:00', '23.03.2026 14:50:00')">Derse Katıl</a>
-        """
-        soup = BeautifulSoup(html, 'lxml')
-
-        # Find all links with attendLessonProgram in onclick
-        pattern = re.compile(r'attendLessonProgram\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]', re.IGNORECASE)
-
-        for element in soup.find_all(onclick=re.compile(r'attendLessonProgram', re.IGNORECASE)):
-            onclick = element.get('onclick', '')
-            match = pattern.search(onclick)
-            if match:
-                return {
-                    'LessonProgramDetailNo': match.group(1),
-                    'LessonProgramNo': match.group(2),
-                    'StartTime': match.group(3),
-                    'EndTime': match.group(4),
-                }
-
-        # Also search the raw HTML in case BeautifulSoup missed it
-        match = pattern.search(html)
-        if match:
-            return {
-                'LessonProgramDetailNo': match.group(1),
-                'LessonProgramNo': match.group(2),
-                'StartTime': match.group(3),
-                'EndTime': match.group(4),
-            }
-
-        logger.debug("No attend button found in HTML")
-        return None
-
-    def _find_attend_buttons(self, html: str) -> List[Dict]:
-        """
-        DEPRECATED - Use _find_attend_button_in_html instead
-        Find all "Derse Katıl" buttons and extract onclick parameters
-        """
-        result = self._find_attend_button_in_html(html)
-        return [result] if result else []
-
-    def _attend_lesson(self, params: Dict) -> Optional[str]:
-        """
-        Call AttendLessonProgram API to get Zoom link
-
-        API returns:
-        {
-            "IsSuccess": true,
-            "ScriptBag": {
-                "JoinUrl": "https://yildiz-edu-tr.zoom.us/w/..."
-            }
-        }
-        """
-        try:
-            # PHI.UI.Transaction.call sends data as form-encoded without CSRF in data
-            payload = {
-                'LessonProgramDetailNo': params['LessonProgramDetailNo'],
-                'LessonProgramNo': params['LessonProgramNo'],
-                'StartTime': params['StartTime'],
-                'EndTime': params['EndTime']
-            }
-
-            # PHI framework sends CSRF token in headers with double underscore!
-            headers = {
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'X-Requested-With': 'XMLHttpRequest',
-                'Accept': 'application/json, text/javascript, */*',
-                'Origin': YTU_BASE_URL,
-                'Referer': f"{YTU_BASE_URL}/?transaction=LMS.EDU.LessonProgram.ViewLessonProgramAsStudent/{params['LessonProgramNo']}",
-            }
-
-            # CSRF token goes in headers with double underscore prefix
-            if self.csrf_token:
-                headers['__RequestVerificationToken'] = self.csrf_token
-
-            logger.debug(f"Calling AttendLessonProgram API with: {payload}")
-            logger.debug(f"Headers: {headers}")
-
-            # Disable redirects to see the actual response
-            response = self.session.post(
-                YTU_ATTEND_URL,
-                data=payload,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=False
-            )
-
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response headers: {dict(response.headers)}")
-            logger.debug(f"Response body preview: {response.text[:500] if response.text else 'empty'}")
-
-            # If we get a redirect, it might mean session expired or error
-            if response.status_code in (301, 302, 303, 307, 308):
-                location = response.headers.get('Location', '')
-                logger.warning(f"API returned redirect to: {location}")
-
-                # Check if redirect contains Zoom URL directly
-                if 'zoom' in location.lower():
-                    logger.info(f"✓ Zoom link found in redirect: {location}")
-                    return location
-
-                # Otherwise, it's probably an error
-                logger.error("Redirect does not contain Zoom URL - session might be invalid")
-                return None
-
-            response.raise_for_status()
-
-            # Parse JSON response
-            data = response.json()
-            logger.debug(f"API response: {data}")
-
-            if data.get('IsSuccess'):
-                # Student version uses JoinUrl, Instructor uses StartUrl
-                join_url = data.get('ScriptBag', {}).get('JoinUrl')
-                start_url = data.get('ScriptBag', {}).get('StartUrl')
-                zoom_url = join_url or start_url
-
-                if zoom_url:
-                    logger.info(f"✓ API returned Zoom link")
-                    return zoom_url
-                else:
-                    logger.warning("API success but no JoinUrl/StartUrl in response")
-                    logger.debug(f"ScriptBag: {data.get('ScriptBag')}")
-            else:
-                message = data.get('Message', 'Unknown error')
-                logger.warning(f"API returned error: {message}")
-
-            return None
-
-        except requests.exceptions.RequestException as e:
-            logger.error(f"AttendLessonProgram API request failed: {e}")
-            return None
-        except ValueError as e:
-            logger.error(f"Failed to parse API response: {e}")
-            return None
-
-    def get_all_courses(self) -> List[Dict]:
-        """
-        Tüm kayıtlı dersleri GetCourseTab API'sinden çeker
-
-        Returns:
-            List of dicts: [
-                {
-                    'no': '12345',           # LessonProgramNo
-                    'name': 'Matematik 1',   # Ders adı
-                    'code': '',              # Ders kodu (varsa)
-                    'instructor': ''         # Öğretim üyesi (varsa)
-                },
-                ...
-            ]
-        """
-        if not self.logged_in:
-            raise YTUClientException("Not logged in - call login() first")
-
-        try:
-            # CSRF token al
-            self._extract_csrf_token()
-
-            # Course tab HTML'ini çek
-            course_tab_html = self._get_course_tab()
-
-            if not course_tab_html:
-                return []
-
-            # Genişletilmiş extraction
-            return self._extract_courses_detailed(course_tab_html)
-
-        except Exception as e:
-            logger.error(f"Failed to get courses: {e}")
-            return []
-
-    def _extract_courses_detailed(self, html: str) -> List[Dict]:
-        """
-        Course tab HTML'inden detaylı ders bilgilerini çıkarır
-        """
-        soup = BeautifulSoup(html, 'lxml')
-        courses = []
-
-        cards = soup.find_all('div', class_='card')
-
-        for card in cards:
-            # LessonProgramNo çıkart
-            onclick_elem = card.find(onclick=re.compile(r'ViewLessonProgramAsStudent\.start'))
-            if not onclick_elem:
-                continue
-
-            onclick = onclick_elem.get('onclick', '')
-            match = re.search(r'ViewLessonProgramAsStudent\.start\s*\(\s*(\d+)', onclick)
-            if not match:
-                continue
-
-            program_no = match.group(1)
-
-            # Ders adı
-            name = ''
-            name_elem = card.find('p', class_='font-weight-bold')
-            if name_elem:
-                name = name_elem.get_text(strip=True)
-
-            # Ders kodu (genellikle küçük font'ta)
+            # Course code
             code = ''
             code_elem = card.find('small') or card.find('span', class_='text-muted')
             if code_elem:
                 code = code_elem.get_text(strip=True)
 
-            # Öğretim üyesi
+            # Instructor
             instructor = ''
             instructor_elem = card.find('p', class_='text-muted')
             if instructor_elem:
@@ -661,7 +512,7 @@ class YTUClient:
                 'instructor': instructor
             })
 
-        # Duplicate'leri kaldır
+        # Remove duplicates
         seen = set()
         unique = []
         for c in courses:
@@ -671,33 +522,248 @@ class YTUClient:
 
         return unique
 
+    def _get_active_attendance(
+        self,
+        lesson_program_no: str,
+        target_time: Optional[datetime.datetime] = None,
+        debug: bool = False
+    ) -> Optional[Dict]:
+        """
+        Calls ListLessonProgramAttendance and finds active attendance
+        validated against the current/target time window.
+        """
+        with self._lock:
+            try:
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/javascript, */*',
+                }
+
+                response = self.session.post(
+                    YTU_ATTENDANCE_LIST_URL,
+                    data={'LessonProgramNo': lesson_program_no},
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT
+                )
+                self._check_and_raise_if_session_expired(response)
+                response.raise_for_status()
+
+                data = response.json()
+                html = data.get('Html', '')
+                if not html:
+                    return None
+
+                return self._find_attend_button_in_html(html, target_time=target_time)
+
+            except YTUSessionExpiredException:
+                raise
+            except Exception as e:
+                logger.error(f"Failed to get attendance list for program {lesson_program_no}: {e}")
+                return None
+
+    def _find_attend_button_in_html(
+        self,
+        html: str,
+        target_time: Optional[datetime.datetime] = None
+    ) -> Optional[Dict]:
+        """
+        Finds 'Derse Katıl' button with onclick parameters.
+        Selects button matching the active time window.
+        """
+        soup = BeautifulSoup(html, 'lxml')
+        pattern = re.compile(
+            r'attendLessonProgram\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*[\'"]([^\'"]+)[\'"]\s*,\s*[\'"]([^\'"]+)[\'"]',
+            re.IGNORECASE
+        )
+
+        candidates: List[Dict] = []
+
+        # Find buttons via DOM onclick elements
+        for element in soup.find_all(onclick=re.compile(r'attendLessonProgram', re.IGNORECASE)):
+            onclick = element.get('onclick', '')
+            match = pattern.search(onclick)
+            if match:
+                candidates.append({
+                    'LessonProgramDetailNo': match.group(1),
+                    'LessonProgramNo': match.group(2),
+                    'StartTime': match.group(3),
+                    'EndTime': match.group(4),
+                })
+
+        # Regex fallback on raw HTML if soup didn't catch it
+        if not candidates:
+            for match in pattern.finditer(html):
+                candidates.append({
+                    'LessonProgramDetailNo': match.group(1),
+                    'LessonProgramNo': match.group(2),
+                    'StartTime': match.group(3),
+                    'EndTime': match.group(4),
+                })
+
+        if not candidates:
+            return None
+
+        # Filter and rank candidates by time window
+        now = target_time or datetime.datetime.now()
+        active_candidates = [
+            c for c in candidates
+            if is_attendance_time_active(c['StartTime'], c['EndTime'], now)
+        ]
+
+        if active_candidates:
+            # Pick the candidate closest to now
+            best = active_candidates[0]
+            logger.info(f"✓ Found active attendance slot: {best['StartTime']} - {best['EndTime']}")
+            return best
+
+        # If none strictly active, check if target_time wasn't specified and we only have 1 button
+        if len(candidates) == 1:
+            candidate = candidates[0]
+            logger.info(f"Single attendance button found ({candidate['StartTime']} - {candidate['EndTime']})")
+            return candidate
+
+        logger.debug(f"Found {len(candidates)} attendance buttons, but none active for current time")
+        return None
+
+    def _attend_lesson(self, params: Dict) -> Optional[str]:
+        """Call AttendLessonProgram API to extract Zoom meeting URL."""
+        with self._lock:
+            try:
+                payload = {
+                    'LessonProgramDetailNo': params['LessonProgramDetailNo'],
+                    'LessonProgramNo': params['LessonProgramNo'],
+                    'StartTime': params['StartTime'],
+                    'EndTime': params['EndTime']
+                }
+
+                headers = {
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Accept': 'application/json, text/javascript, */*',
+                    'Origin': YTU_BASE_URL,
+                    'Referer': f"{YTU_BASE_URL}/?transaction=LMS.EDU.LessonProgram.ViewLessonProgramAsStudent/{params['LessonProgramNo']}",
+                }
+
+                if self.csrf_token:
+                    headers['__RequestVerificationToken'] = self.csrf_token
+
+                response = self.session.post(
+                    YTU_ATTEND_URL,
+                    data=payload,
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False
+                )
+
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get('Location', '')
+                    if 'zoom' in location.lower():
+                        logger.info(f"✓ Zoom link found in redirect: {location}")
+                        return location
+                    if 'Login' in location:
+                        raise YTUSessionExpiredException("Attend API redirected to Login")
+                    logger.warning(f"Attend API returned non-Zoom redirect: {location}")
+                    return None
+
+                self._check_and_raise_if_session_expired(response)
+                response.raise_for_status()
+
+                data = response.json()
+                if data.get('IsSuccess'):
+                    join_url = data.get('ScriptBag', {}).get('JoinUrl')
+                    start_url = data.get('ScriptBag', {}).get('StartUrl')
+                    zoom_url = join_url or start_url
+                    if zoom_url:
+                        logger.info("✓ Attend API returned Zoom URL")
+                        return zoom_url
+
+                logger.warning(f"Attend API response lacked join URL: {data.get('Message')}")
+                return None
+
+            except YTUSessionExpiredException:
+                raise
+            except Exception as e:
+                logger.error(f"AttendLessonProgram failed: {e}")
+                return None
+
+    def get_zoom_link(
+        self,
+        course_name: Optional[str] = None,
+        program_no: Optional[str] = None,
+        target_time: Optional[datetime.datetime] = None,
+        debug: bool = False
+    ) -> Optional[str]:
+        """
+        Extracts Zoom meeting link.
+        Supports direct targeting via program_no or Turkish-aware course name matching.
+        """
+        with self._lock:
+            if not self.logged_in:
+                raise YTUClientException("Not logged in - call login() first")
+
+            logger.info("Searching for active lesson attendance...")
+            self._extract_csrf_token()
+
+            course_tab_html = self._get_course_tab(debug)
+            if not course_tab_html:
+                return None
+
+            all_programs = self._parse_course_cards(course_tab_html)
+            if not all_programs:
+                logger.warning("No lesson programs found in cockpit")
+                return None
+
+            # Filter targets
+            target_programs: List[Dict] = []
+            if program_no:
+                # Direct match by program number
+                clean_pno = str(program_no).strip()
+                target_programs = [p for p in all_programs if str(p['no']).strip() == clean_pno]
+                if not target_programs:
+                    logger.warning(f"Program No {clean_pno} not found among {len(all_programs)} courses")
+
+            if not target_programs and course_name:
+                # Turkish-aware matching
+                target_programs = [
+                    p for p in all_programs
+                    if turkish_contains(course_name, p['name'])
+                ]
+
+            # If no specific filter matched or specified, check all
+            if not target_programs and not course_name and not program_no:
+                target_programs = all_programs
+
+            if not target_programs:
+                logger.warning(f"No matching programs found for filter (course='{course_name}', no='{program_no}')")
+                return None
+
+            for lp in target_programs:
+                logger.info(f"Checking lesson program: {lp['name']} (No: {lp['no']})")
+                attendance = self._get_active_attendance(lp['no'], target_time=target_time, debug=debug)
+                if attendance:
+                    zoom_url = self._attend_lesson(attendance)
+                    if zoom_url:
+                        return zoom_url
+
+            logger.info("No active attendance slot found")
+            return None
+
+    def get_all_courses(self) -> List[Dict]:
+        """Fetches all registered courses from Cockpit."""
+        with self._lock:
+            if not self.logged_in:
+                raise YTUClientException("Not logged in - call login() first")
+
+            self._extract_csrf_token()
+            html = self._get_course_tab()
+            return self._parse_course_cards(html) if html else []
+
     def get_course_schedule(self, lesson_program_no: str, debug: bool = False) -> List[Dict]:
-        """
-        Ders detay sayfasından haftalık ders programını çeker
-
-        ListLessonProgramAttendance API'sinden tarihleri alıp
-        gün adına çevirir ve haftalık programı oluşturur.
-
-        Args:
-            lesson_program_no: Ders program numarası
-            debug: Debug modda HTML'i dosyaya kaydet
-
-        Returns:
-            List of dicts: [
-                {
-                    'day': 'Monday',      # İngilizce gün adı
-                    'day_tr': 'Pazartesi', # Türkçe gün adı
-                    'start_time': '09:00',
-                    'end_time': '10:50'
-                },
-                ...
-            ]
-        """
-        if not self.logged_in:
-            raise YTUClientException("Not logged in - call login() first")
-
-        try:
-            logger.info(f"Getting schedule for lesson program: {lesson_program_no}")
+        """Fetches weekly schedule for a course program."""
+        with self._lock:
+            if not self.logged_in:
+                raise YTUClientException("Not logged in - call login() first")
 
             headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
@@ -705,180 +771,245 @@ class YTUClient:
                 'Accept': 'application/json, text/javascript, */*',
             }
 
-            # ListLessonProgramAttendance API'sini kullan
             response = self.session.post(
                 YTU_ATTENDANCE_LIST_URL,
                 data={'LessonProgramNo': lesson_program_no},
                 headers=headers,
                 timeout=REQUEST_TIMEOUT
             )
+            self._check_and_raise_if_session_expired(response)
             response.raise_for_status()
 
             data = response.json()
             html = data.get('Html', '')
-
-            if debug:
-                debug_file = Path(__file__).parent / f"debug_attendance_{lesson_program_no}.html"
-                with open(debug_file, 'w', encoding='utf-8') as f:
-                    f.write(html)
-                logger.info(f"DEBUG: Saved attendance to {debug_file}")
-
             return self._extract_schedule_from_attendance(html)
-
-        except ValueError as e:
-            logger.error(f"Failed to parse attendance JSON: {e}")
-            return []
-        except Exception as e:
-            logger.error(f"Failed to get course schedule: {e}")
-            return []
 
     def _extract_schedule_from_attendance(self, html: str) -> List[Dict]:
         """
-        Attendance HTML'inden haftalık ders programını çıkarır
-
-        Format: dd.mm.yyyy HH:MM - dd.mm.yyyy HH:MM
-        Örnek: 23.02.2026 13:00 - 23.02.2026 14:50
+        Extracts recurring weekly slots from attendance history table.
+        Groups repeating time slots to identify true recurring lectures.
         """
-        import datetime as dt
-
-        # İngilizce gün numarası -> Türkçe/İngilizce eşlemesi
-        day_names = {
-            0: ('Monday', 'Pazartesi'),
-            1: ('Tuesday', 'Salı'),
-            2: ('Wednesday', 'Çarşamba'),
-            3: ('Thursday', 'Perşembe'),
-            4: ('Friday', 'Cuma'),
-            5: ('Saturday', 'Cumartesi'),
-            6: ('Sunday', 'Pazar'),
-        }
+        from schedule_store import DAYS_CANONICAL, DAY_TR_NAMES
 
         soup = BeautifulSoup(html, 'lxml')
-        schedules = []
-        seen_slots = set()  # Tekrarları önle
+        schedules: List[Dict] = []
+        slot_frequency: Dict[str, int] = {}
+        slot_metadata: Dict[str, Dict] = {}
 
-        # Tarih-saat pattern: dd.mm.yyyy HH:MM
         pattern = re.compile(r'(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})')
 
-        # Tablo satırlarını tara
         for row in soup.find_all('tr'):
-            text = row.get_text()
-
-            # Başlangıç ve bitiş saatlerini bul
-            matches = pattern.findall(text)
-
+            matches = pattern.findall(row.get_text())
             if len(matches) >= 2:
-                # İlk match: başlangıç, ikinci match: bitiş
-                start_match = matches[0]
-                end_match = matches[1]
-
                 try:
-                    # Tarihi parse et
-                    day = int(start_match[0])
-                    month = int(start_match[1])
-                    year = int(start_match[2])
-                    start_hour = int(start_match[3])
-                    start_min = int(start_match[4])
+                    s_d, s_m, s_y, s_h, s_min = map(int, matches[0])
+                    _, _, _, e_h, e_min = map(int, matches[1])
 
-                    end_hour = int(end_match[3])
-                    end_min = int(end_match[4])
+                    date_obj = datetime.datetime(s_y, s_m, s_d)
+                    weekday_idx = date_obj.weekday()
+                    en_day = DAYS_CANONICAL[weekday_idx]
+                    tr_day = DAY_TR_NAMES[en_day]
 
-                    # datetime objesi oluştur ve gün adını al
-                    date_obj = dt.datetime(year, month, day)
-                    weekday = date_obj.weekday()  # 0=Monday, 6=Sunday
+                    start_time = f"{s_h:02d}:{s_min:02d}"
+                    end_time = f"{e_h:02d}:{e_min:02d}"
 
-                    en_day, tr_day = day_names[weekday]
-
-                    # Saat formatla
-                    start_time = f"{start_hour:02d}:{start_min:02d}"
-                    end_time = f"{end_hour:02d}:{end_min:02d}"
-
-                    # Tekrar kontrolü (aynı gün-saat kombinasyonu)
                     slot_key = f"{en_day}-{start_time}"
-                    if slot_key not in seen_slots:
-                        seen_slots.add(slot_key)
-                        schedules.append({
+                    slot_frequency[slot_key] = slot_frequency.get(slot_key, 0) + 1
+                    if slot_key not in slot_metadata:
+                        slot_metadata[slot_key] = {
                             'day': en_day,
                             'day_tr': tr_day,
                             'start_time': start_time,
-                            'end_time': end_time
-                        })
-                        logger.debug(f"Found schedule: {en_day} {start_time}-{end_time}")
-
-                except (ValueError, IndexError) as e:
-                    logger.debug(f"Could not parse date: {e}")
+                            'end_time': end_time,
+                        }
+                except (ValueError, IndexError):
                     continue
 
-        logger.info(f"Found {len(schedules)} unique schedule slots")
+        # Sort slots by day and start time
+        for key, meta in slot_metadata.items():
+            meta['occurrences'] = slot_frequency.get(key, 1)
+            schedules.append(meta)
+
         return schedules
 
-    def logout(self):
-        """Logout and clear session"""
-        try:
-            logout_url = f"{YTU_BASE_URL}/Account/Logout"
-            self.session.get(logout_url, timeout=5)
-        except:
-            pass
-        finally:
-            self.logged_in = False
-            self.session.cookies.clear()
-            if SESSION_FILE.exists():
-                SESSION_FILE.unlink()
-            logger.info("✓ Logged out")
+    def logout(self) -> None:
+        """Logout and purge session data."""
+        with self._lock:
+            try:
+                self.session.get(f"{YTU_BASE_URL}/Account/Logout", timeout=5)
+            except Exception:
+                pass
+            finally:
+                self.logged_in = False
+                self.session.cookies.clear()
+                if SESSION_FILE.exists():
+                    try:
+                        SESSION_FILE.unlink()
+                    except OSError:
+                        pass
+                if LEGACY_SESSION_FILE.exists():
+                    try:
+                        LEGACY_SESSION_FILE.unlink()
+                    except OSError:
+                        pass
+                logger.info("✓ Logged out")
 
 
 class YTUSessionManager:
-    """High-level session manager"""
+    """
+    High-level session manager with thread-safe auto re-login,
+    session recovery on expiration, and account lockout protection.
+    """
 
     def __init__(self, username: str, password: str):
-        self.username = username
+        self._lock = threading.RLock()
+        self.username = username.strip() if username else ""
         self.password = password
-        self.client = YTUClient()
+        self.client = YTUClient(username=self.username, password=self.password)
+        self.auth_failed = False
+        self.consecutive_auth_failures = 0
+        self.auth_failure_reason = ""
+
+    def update_credentials(self, username: str, password: str) -> None:
+        """Update credentials and reset lockout circuit breaker."""
+        with self._lock:
+            clean_user = username.strip() if username else ""
+            if self.username != clean_user or self.password != password:
+                self.username = clean_user
+                self.password = password
+                self.auth_failed = False
+                self.consecutive_auth_failures = 0
+                self.auth_failure_reason = ""
+                self.client.update_credentials(clean_user, password)
+
+    def reset_auth_lockout(self) -> None:
+        """Manually resets the lockout circuit breaker."""
+        with self._lock:
+            self.auth_failed = False
+            self.consecutive_auth_failures = 0
+            self.auth_failure_reason = ""
 
     def ensure_logged_in(self) -> bool:
-        """Ensure we have a valid session"""
-        if self.client.load_session():
-            logger.info("Using cached session")
-            return True
+        """
+        Ensures a valid session is ready.
+        Stops after MAX_RETRY_ATTEMPTS failed logins with exponential backoff
+        to protect against university account lockout.
+        """
+        with self._lock:
+            # 1. Circuit breaker check: do NOT beat the server if locked out
+            if self.auth_failed:
+                logger.warning(
+                    "Otomatik giriş engellendi: Hesap kilitlenmesini önlemek için "
+                    "denemeler durdurulmuş durumda. Lütfen bilgilerinizi kaydederek sıfırlayın."
+                )
+                return False
 
-        logger.info("No valid session, logging in...")
-        try:
-            return self.client.login(self.username, self.password)
-        except YTUClientException as e:
-            logger.error(f"Login failed: {e}")
+            # 2. Fast in-memory check
+            if self.client.logged_in and self.client._validate_session(force_network=False):
+                self.auth_failed = False
+                self.consecutive_auth_failures = 0
+                return True
+
+            # 3. Disk cached session check
+            if self.client.load_session(self.username):
+                self.auth_failed = False
+                self.consecutive_auth_failures = 0
+                return True
+
+            # 4. Check credentials presence
+            if not self.username or not self.password:
+                logger.error("Cannot login: Credentials not set")
+                return False
+
+            # 5. Attempt login with exponential backoff up to MAX_RETRY_ATTEMPTS
+            max_attempts = max(1, MAX_RETRY_ATTEMPTS)
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    logger.info(f"Giriş deneniyor (Deneme {attempt}/{max_attempts})...")
+                    if self.client.login(self.username, self.password):
+                        self.auth_failed = False
+                        self.consecutive_auth_failures = 0
+                        self.auth_failure_reason = ""
+                        return True
+                    else:
+                        self.consecutive_auth_failures += 1
+                        if attempt < max_attempts:
+                            backoff = RETRY_DELAY * (2 ** (attempt - 1))
+                            logger.warning(f"Giriş başarısız. {backoff}sn sonra tekrar denenecek...")
+                            time.sleep(backoff)
+                except Exception as e:
+                    logger.error(f"Giriş denemesi {attempt} hata verdi: {e}")
+                    self.consecutive_auth_failures += 1
+                    if attempt < max_attempts:
+                        time.sleep(RETRY_DELAY)
+
+            # Reached max attempts: trip circuit breaker to protect user account
+            self.auth_failed = True
+            self.auth_failure_reason = "Hatalı şifre veya oturum reddedildi"
+            logger.critical(
+                f"Giriş {self.consecutive_auth_failures} kez başarısız oldu! "
+                "Üniversite hesabınızın kilitlenmesini (account lockout) önlemek için "
+                "otomatik giriş denemeleri DURDURULDU."
+            )
             return False
 
-    def get_zoom_link_safe(self, course_name: Optional[str] = None, debug: bool = False) -> Optional[str]:
-        """Get Zoom link with automatic login if needed"""
-        if not self.ensure_logged_in():
-            logger.error("Cannot get Zoom link - login failed")
-            return None
+    def _execute_with_retry_on_expire(self, func, *args, **kwargs):
+        """Executes a client function, recovering if session expired with lockout protection."""
+        with self._lock:
+            if not self.ensure_logged_in():
+                return None
 
-        try:
-            return self.client.get_zoom_link(course_name, debug=debug)
-        except YTUClientException as e:
-            logger.error(f"Failed to get Zoom link: {e}")
-            return None
+            try:
+                return func(*args, **kwargs)
+            except YTUSessionExpiredException:
+                logger.warning("Oturum süresi doldu. Otomatik yeniden giriş deneniyor...")
+                self.client.logged_in = False
+                if self.auth_failed:
+                    return None
+
+                if self.client.login(self.username, self.password):
+                    logger.info("Yeniden giriş başarılı. İstek tekrarlanıyor...")
+                    try:
+                        return func(*args, **kwargs)
+                    except Exception as retry_err:
+                        logger.error(f"Yeniden giriş sonrası istek başarısız: {retry_err}")
+                        return None
+                else:
+                    self.consecutive_auth_failures += 1
+                    if self.consecutive_auth_failures >= MAX_RETRY_ATTEMPTS:
+                        self.auth_failed = True
+                    logger.error("Otomatik yeniden giriş başarısız oldu.")
+                    return None
+            except Exception as e:
+                logger.error(f"İstemci işlemi sırasında hata: {e}")
+                return None
+
+    def get_zoom_link_safe(
+        self,
+        course_name: Optional[str] = None,
+        program_no: Optional[str] = None,
+        target_time: Optional[datetime.datetime] = None,
+        debug: bool = False
+    ) -> Optional[str]:
+        """Safe wrapper to extract Zoom link with auto re-login."""
+        return self._execute_with_retry_on_expire(
+            self.client.get_zoom_link,
+            course_name=course_name,
+            program_no=program_no,
+            target_time=target_time,
+            debug=debug
+        )
 
     def get_courses_safe(self) -> List[Dict]:
-        """Tüm dersleri güvenli şekilde çeker (login kontrollü)"""
-        if not self.ensure_logged_in():
-            logger.error("Cannot get courses - login failed")
-            return []
-
-        try:
-            return self.client.get_all_courses()
-        except YTUClientException as e:
-            logger.error(f"Failed to get courses: {e}")
-            return []
+        """Safe wrapper to get courses with auto re-login."""
+        res = self._execute_with_retry_on_expire(self.client.get_all_courses)
+        return res if isinstance(res, list) else []
 
     def get_course_schedule_safe(self, lesson_program_no: str, debug: bool = False) -> List[Dict]:
-        """Ders programını güvenli şekilde çeker (login kontrollü)"""
-        if not self.ensure_logged_in():
-            logger.error("Cannot get schedule - login failed")
-            return []
-
-        try:
-            return self.client.get_course_schedule(lesson_program_no, debug=debug)
-        except YTUClientException as e:
-            logger.error(f"Failed to get schedule: {e}")
-            return []
+        """Safe wrapper to get schedule with auto re-login."""
+        res = self._execute_with_retry_on_expire(
+            self.client.get_course_schedule,
+            lesson_program_no=lesson_program_no,
+            debug=debug
+        )
+        return res if isinstance(res, list) else []

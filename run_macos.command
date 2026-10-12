@@ -195,7 +195,7 @@ fi
 #      'pip show' yerine gercek import denemesi kullanilir.
 # ------------------------------------------------------------
 deps_installed() {
-    "$VENV_PY" -c 'import requests, bs4, lxml, urllib3' >/dev/null 2>&1
+    "$VENV_PY" -c 'import requests, bs4, lxml, urllib3, keyring' >/dev/null 2>&1
 }
 
 info "Bagimliliklar kontrol ediliyor..."

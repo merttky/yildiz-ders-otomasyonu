@@ -1,0 +1,73 @@
+name: CI Tests
+
+on:
+  push:
+    branches: [ main, ci-deneme ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }} - Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.python == '3.14' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        python: ["3.9", "3.13", "3.14"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          allow-prereleases: true
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.lock || pip install -r requirements.txt
+
+      - name: Run test suite
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Import all project modules
+        run: |
+          python -c "import main, scheduler, ytu_client, config, credentials, schedule_store, turkish_utils, zoom_launcher, discord_notifier; print('All modules imported successfully')"
+
+  test-windows-launcher:
+    name: Windows Launcher Script Test
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test run_windows.bat --help
+        shell: cmd
+        run: |
+          call run_windows.bat --help
+
+      - name: Test run_windows.bat --install-only
+        shell: cmd
+        run: |
+          call run_windows.bat --install-only

@@ -1,119 +1,79 @@
 # YILDIZ Ders Otomasyonu
 
-Yıldız Teknik Üniversitesi online derslerine otomatik katılım sağlayan hafif ve hızlı uygulama.
+Yıldız Teknik Üniversitesi online derslerine (LMS) otomatik katılım sağlayan hafif, hızlı ve güvenli masaüstü otomasyonu.
 
-## Özellikler
+Tarayıcı (Selenium) gerektirmez; doğrudan üniversite API'si üzerinden çalışır, ders saatlerini otomatik algılar ve vakti geldiğinde Zoom'u başlatır.
 
-- **Selenium-free**: Tarayıcı gerektirmez, sadece HTTP API kullanır
-- **Hafif**: Düşük kaynak tüketimi, hızlı başlatma
-- **Otomatik katılım**: Ders saati geldiğinde Zoom otomatik açılır
-- **API tabanlı ders çekme**: Derslerinizi ve saatlerini otomatik algılar
-- **Çoklu platform**: macOS ve Windows desteği
+---
 
-## Gereksinimler
+## 🚀 Özellikler
 
-1. **Python 3.8+**
-   - macOS: `brew install python` veya [python.org](https://www.python.org/downloads/)
-   - Windows: [python.org](https://www.python.org/downloads/) (Kurulumda "Add to PATH" işaretleyin)
+- **Tarayıcısız & Hafif:** Selenium gerektirmez, doğrudan hafif HTTP API kullanır; arka planda sessizce ve minimum kaynakla çalışır.
+- **Otomatik Ders Çekme:** "Derslerimi Getir" butonuyla haftalık ders programınızı ve saatlerinizi tek tıkla senkronize eder.
+- **Zamanında Katılım:** Ders saati geldiğinde Zoom'u doğrudan ders oturumuna bağlar.
+- **Canlı Durum Göstergesi:** Arka plandaki durumu ve sıradaki dersi arayüzde anlık gösterir.
+- **Discord Bildirimleri (Opsiyonel):** Derse girildiğinde veya hoca linki açmadığında Discord üzerinden telefonunuza bildirim gönderir.
+- **Güvenli:** Şifreniz asla 3. parti bir sunucuya gitmez, işletim sisteminizin kasasında (Keychain / Credential Manager) saklanır.
 
-2. **Zoom Desktop**
-   - [zoom.us/download](https://zoom.us/download)
+---
 
-## Kurulum ve Çalıştırma
+## ⚡ Kurulum ve Çalıştırma
 
-### macOS
+### Gereksinimler
+1. **Python 3.8+** ([python.org](https://www.python.org/downloads/))
+   - *Windows kullanıcıları:* Kurulumun ilk ekranındaki **"Add python.exe to PATH"** kutucuğunu mutlaka işaretleyin.
+2. **Zoom Desktop** ([zoom.us/download](https://zoom.us/download))
 
-```bash
-./run_macos.command
-```
+### Başlatma
 
-Veya Finder'da `run_macos.command` dosyasına çift tıklayın.
+- **Windows:** `run_windows.bat` dosyasına çift tıklayın.
+- **macOS:** `run_macos.command` dosyasına çift tıklayın.
 
-Ek seçenekler:
+*(Gerekli tüm sanal ortam ve paket kurulumları ilk çalıştırmada otomatik olarak yapılır.)*
 
-```bash
-./run_macos.command --recreate-venv   # Sanal ortamı silip yeniden oluştur
-./run_macos.command --install-only    # Sadece kurulum yap, uygulamayı çalıştırma
-./run_macos.command --help            # Yardım
-```
+---
 
-### Windows
+## ⚙️ Önemli: Zoom Otomatik Katılım Ayarları
 
-`run_windows.bat` dosyasına çift tıklayın (aynı seçenekler geçerlidir).
+Uygulama ders saatinde Zoom'u toplantı linkiyle doğrudan başlatır. Ancak siz bilgisayar başında değilken toplantıya **ek bir tıklama yapmadan ve mikrofon/kamera kazaları yaşamadan** tam otomatik bağlanabilmesi için Zoom ayarlarını aşağıdaki gibi yapılandırmanız gerekir:
 
-> **Not:** İlk çalıştırmada otomatik olarak virtual environment oluşturulur ve bağımlılıklar yüklenir.
->
-> **İpucu:** Proje klasörünü taşırsanız `venv` klasörü eski yolu gösterir. Bu durumda başlatıcı
-> bozuk sanal ortamı otomatik algılar ve yeniden oluşturur. Elle düzeltmek isterseniz:
->
-> ```bash
-> rm -rf venv && ./run_macos.command
-> ```
+**Zoom Desktop → Ayarlar (Settings) → Meetings & webinars (Toplantılar):**
+- ✅ **Keep my camera off** (Derse girerken kameramı kapalı tut)
+- ✅ **Keep my microphone muted** (Derse girerken mikrofonumu sessize al)
+- ✅ **Automatically connect to computer audio** (Bilgisayar sesine otomatik bağlan — *tıklama beklemeden sese bağlar*)
 
-### Başlatıcılar nasıl çalışır?
+![Zoom Otomatik Katılım Ayarları](assets/zoom_settings.png)
 
-Başlatıcılar sanal ortamı `activate` ile etkinleştirmez; doğrudan `venv` içindeki Python'u
-çağırır (`python -m pip`). Böylece proje klasörü taşındığında veya sistemde `pip` komutu
-bulunmadığında sorun yaşanmaz.
+---
 
-## Kullanım
+## 📖 Kullanım Rehberi
 
-### 1. Giriş
+1. **Giriş Bilgileri:**  
+   Okul e-postanızı (`ogrenci@std.yildiz.edu.tr`) ve şifrenizi girip **"Bilgileri Kaydet"** butonuna basın.
+2. **Dersleri Ekleme:**  
+   **"Derslerimi Getir (API)"** butonuna tıklayın, gelen listeden derslerinizi seçip **"Seçilenleri Ekle"** deyin. Günler ve saatler otomatik eklenir.
+3. **Otomasyon:**  
+   Uygulamayı açık bırakmanız yeterlidir. Ders saatinde Zoom otomatik başlatılır. *(Önemli: Bilgisayarınızın uykuya geçmesini engelleyin, aksi halde ders saatinde kaçırılır.)*
+4. **Anlık Katılım:**  
+   Ders saati içindeyken istediğiniz zaman **"Şimdi Derse Gir"** butonuna basarak derse anında bağlanabilirsiniz.
+5. **Discord Bildirimi (İsteğe Bağlı):**  
+   **"Ayarlar (Webhook)"** sekmesinden Discord Webhook adresinizi ekleyerek ders durumlarını telefonunuza bildirim olarak alabilirsiniz.
 
-- Okul mailinizi girin (örnek: `ogrenci@std.yildiz.edu.tr`)
-- Şifrenizi girin
-- "Bilgileri Kaydet" tıklayın
+---
 
-### 2. Ders Ekleme
-
-**Otomatik (Önerilen):**
-1. "Derslerimi Getir (API)" tıklayın
-2. Derslerinizi seçin
-3. "Seçilenleri Ekle" tıklayın
-4. Saatler otomatik eklenir
-
-**Manuel:**
-1. Gün seçin
-2. Saat girin (örnek: 09:30)
-3. Ders adını girin
-4. "Ders Ekle" tıklayın
-
-### 3. Otomatik Katılım
-
-Uygulama açık kaldığı sürece arka planda çalışır. Ders saati geldiğinde otomatik olarak Zoom açılır.
-
-### 4. Anlık Katılım
-
-"Şimdi Derse Gir" butonu ile aktif derse hemen katılabilirsiniz.
-
-## Sorun Giderme
+## ❓ Sorun Giderme
 
 | Sorun | Çözüm |
-|-------|-------|
-| "Login başarısız" | Kullanıcı adı/şifre kontrol edin |
-| "Ders bulunamadı" | Ders saatinde olduğunuzdan emin olun |
-| Zoom açılmıyor | Zoom Desktop yüklü mü kontrol edin |
-| `pip: command not found` | `./run_macos.command --recreate-venv` (venv bozuk/eski) |
-| `No module named tkinter` | macOS: `brew install python-tk` |
-| Python 3.8+ bulunamadı | `brew install python` veya python.org kurulumu |
+|---|---|
+| **"Giriş başarısız"** | Kullanıcı adı veya şifrenizi kontrol edin. |
+| **Mac'te izin hatası** | Terminal'de `chmod +x run_macos.command` komutunu çalıştırın. |
+| **Windows'ta Microsoft Store açılıyor** | Python kurulu değil veya PATH'e eklenmemiş; kurarken "Add to PATH" işaretleyin. |
+| **`No module named tkinter` (macOS)** | Homebrew kullanıyorsanız `brew install python-tk` çalıştırın. |
+| **Zoom açılmıyor** | Bilgisayarınızda Zoom Desktop uygulamasının kurulu olduğunu doğrulayın. |
+| **Bozuk sanal ortam (venv)** | macOS'ta `./run_macos.command --recreate-venv`, Windows'ta `run_windows.bat --recreate-venv` çalıştırın. |
 
-## Dosya Yapısı
+---
 
-```
-main.py              - Ana uygulama (GUI)
-ytu_client.py        - YTU Online API istemcisi
-zoom_launcher.py     - Zoom protokol başlatıcı
-config.py            - Yapılandırma ayarları
-run_macos.command    - macOS başlatıcı
-run_windows.bat      - Windows başlatıcı
-schedule.json        - Ders programı (otomatik oluşur)
-discord_notifier.py  - Discord Webhook bildirimi gönderir
-```
+## 📄 Lisans
 
-## Lisans
-
-MIT License - Detaylar için [LICENSE](LICENSE) dosyasına bakın.
-
-## Yazar
-
-Mert Kaya
+Bu proje [MIT Lisansı](LICENSE) altında dağıtılmaktadır.

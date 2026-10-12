@@ -1,821 +1,751 @@
 """
-YILDIZ Ders Otomasyonu - v1.0
-Selenium-free, Hafif & Hızlı
+YILDIZ Ders Otomasyonu - Main GUI & Application
+v2.0 - Selenium-free, Lightweight & Thread-Safe
 """
-import tkinter as tk
-from tkinter import messagebox, ttk
-import json
-import threading
-import time
+from __future__ import annotations
+
 import datetime
-import shelve
+import logging
 import os
 import sys
-import logging
+import threading
+from typing import Dict, List, Optional, Tuple
 
-# ── Core modules (Pure Terminal) ─────────────────────────────────────────────
-from ytu_client import YTUSessionManager, YTUClientException
-from zoom_launcher import open_zoom_link
-from config import SCHEDULE_FILE, USER_FILE, CHECK_INTERVAL, JOIN_TOLERANCE, MANUAL_JOIN_BEFORE, MANUAL_JOIN_AFTER
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+from config import (
+    APP_NAME,
+    APP_VERSION,
+    MANUAL_JOIN_AFTER,
+    MANUAL_JOIN_BEFORE,
+    setup_logging,
+)
+from credentials import (
+    clear_credentials,
+    load_credentials,
+    load_webhook_url,
+    migrate_legacy_shelve_if_needed,
+    save_credentials,
+    save_webhook_url,
+)
 from discord_notifier import (
-    notify_lesson_joined,
+    notify_auth_failed,
     notify_lesson_failed,
-    notify_scheduler_triggered,
+    notify_lesson_joined,
+    notify_lesson_missed,
     notify_no_link_found,
-    test_webhook
+    notify_still_waiting_for_link,
+    notify_waiting_for_link,
+    test_webhook,
 )
+from schedule_store import (
+    DAYS_CANONICAL,
+    delete_lesson as store_delete_lesson,
+    get_current_day,
+    get_day_display_name,
+    load_schedule,
+    save_schedule,
+)
+from scheduler import JoinResult, LessonScheduler
+from ytu_client import YTUSessionManager
+from zoom_launcher import open_zoom_link
 
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('automation.log', encoding='utf-8')
-    ]
-)
 logger = logging.getLogger(__name__)
 
-# ── Global state ─────────────────────────────────────────────────────────────
-lesson_mapping = []  # [(day, index), ...]
-joined_lessons = set()  # Prevent duplicate joins
-current_username = ""
-current_password = ""
-discord_webhook_url = ""  # Discord webhook URL for notifications
-ytu_session = None  # YTU session manager (lazy init)
+
+def format_delta_time(delta_sec: int) -> str:
+    """Formats delta seconds into human readable Turkish time string (e.g. '12 dk', '1 sa 05 dk', '45 sn')."""
+    if delta_sec < 60:
+        return f"{max(0, delta_sec)} sn"
+    total_minutes = delta_sec // 60
+    if total_minutes < 60:
+        return f"{total_minutes} dk"
+    hours = total_minutes // 60
+    mins = total_minutes % 60
+    return f"{hours} sa {mins:02d} dk"
 
 
-# ── Credential Management ────────────────────────────────────────────────────
+class AutomationApp:
+    """
+    Main application controller and Tkinter interface.
+    All background tasks dispatch UI updates through root.after.
+    """
 
-def save_credentials():
-    """Save username and password to shelve storage"""
-    global current_username, current_password
-    current_username = username_entry.get().strip()
-    current_password = password_entry.get().strip()
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
+        self.root.resizable(False, False)
 
-    if not current_username or not current_password:
-        messagebox.showwarning("Uyarı", "Kullanıcı adı ve şifre boş olamaz!")
-        return
+        # Thread-safe session manager
+        self.session_manager: Optional[YTUSessionManager] = None
+        self._automation_lock = threading.Lock()
+        self._status_after_id: Optional[str] = None
 
-    with shelve.open(str(USER_FILE)) as db:
-        db["username"] = current_username
-        db["password"] = current_password
+        # Build UI layout
+        self._setup_styles()
+        self._build_ui()
 
-    messagebox.showinfo("Bilgi", "Kullanıcı bilgileri kaydedildi!")
-    logger.info(f"Credentials saved for: {current_username}")
+        # Initialize credentials and data
+        migrate_legacy_shelve_if_needed()
+        self._load_saved_credentials()
+        self.refresh_lesson_list()
 
+        # Initialize background scheduler with anti-spam and circuit breaker callbacks
+        self.scheduler = LessonScheduler(
+            join_callback=self._scheduler_join_callback,
+            notify_waiting_callback=self._on_notify_waiting,
+            notify_still_waiting_callback=self._on_notify_still_waiting,
+            notify_missed_callback=self._on_notify_missed,
+            notify_auth_failed_callback=self._on_notify_auth_failed,
+            on_auth_failed_alert=self._on_auth_failed_alert,
+        )
+        self.scheduler.start()
+        self._update_status()
 
-def load_credentials():
-    """Load saved credentials and populate GUI fields"""
-    global current_username, current_password
-    try:
-        with shelve.open(str(USER_FILE)) as db:
-            current_username = db.get("username", "")
-            current_password = db.get("password", "")
-            username_entry.insert(0, current_username)
-            password_entry.insert(0, current_password)
-        if current_username:
-            logger.info(f"Loaded credentials for: {current_username}")
-    except Exception as e:
-        logger.warning(f"Could not load credentials: {e}")
+        # Bind window close event
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # ── Thread-Safe UI Helpers ───────────────────────────────────────────────
 
-# ── Discord Webhook Management ────────────────────────────────────────────────
+    def ui_call(self, func, *args, **kwargs) -> None:
+        """Schedules a function to run on the Tkinter main thread."""
+        self.root.after(0, lambda: func(*args, **kwargs))
 
-def load_webhook_url():
-    """Load saved Discord webhook URL"""
-    global discord_webhook_url
-    try:
-        with shelve.open(str(USER_FILE)) as db:
-            discord_webhook_url = db.get("discord_webhook_url", "")
-        if discord_webhook_url:
-            logger.info("Discord webhook URL loaded")
-    except Exception as e:
-        logger.warning(f"Could not load webhook URL: {e}")
+    def show_info(self, title: str, message: str) -> None:
+        self.ui_call(messagebox.showinfo, title, message)
 
+    def show_warning(self, title: str, message: str) -> None:
+        self.ui_call(messagebox.showwarning, title, message)
 
-def save_webhook_url(url: str):
-    """Save Discord webhook URL"""
-    global discord_webhook_url
-    discord_webhook_url = url.strip()
-    with shelve.open(str(USER_FILE)) as db:
-        db["discord_webhook_url"] = discord_webhook_url
-    logger.info("Discord webhook URL saved")
+    def show_error(self, title: str, message: str) -> None:
+        self.ui_call(messagebox.showerror, title, message)
 
+    # ── UI Construction ──────────────────────────────────────────────────────
 
-def open_settings_window():
-    """Open settings window for Discord webhook configuration"""
-    global discord_webhook_url
+    def _setup_styles(self) -> None:
+        self.style = ttk.Style()
+        self.style.configure("Green.TButton", font=("Arial", 10))
+        self.style.configure("Blue.TButton", font=("Arial", 10))
 
-    settings_window = tk.Toplevel(root)
-    settings_window.title("Ayarlar - Discord Webhook")
-    settings_window.geometry("500x200")
-    settings_window.transient(root)
-    settings_window.grab_set()
+    def _build_ui(self) -> None:
+        # 1. Credentials section
+        tk.Label(self.root, text="Okul Maili:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+        self.username_entry = tk.Entry(self.root, width=25)
+        self.username_entry.grid(row=0, column=1, padx=5, pady=5)
 
-    # Discord webhook section
-    tk.Label(
-        settings_window,
-        text="Discord Webhook Ayarlari",
-        font=("Arial", 12, "bold")
-    ).pack(pady=10)
+        tk.Label(self.root, text="Şifre:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
+        self.password_entry = tk.Entry(self.root, show="*", width=25)
+        self.password_entry.grid(row=1, column=1, padx=5, pady=5)
 
-    tk.Label(
-        settings_window,
-        text="Ders katilim bildirimlerini Discord'a gondermek icin webhook URL'i girin.",
-        wraplength=450
-    ).pack(pady=5)
+        tk.Button(
+            self.root,
+            text="Bilgileri Kaydet",
+            command=self.save_user_credentials,
+            width=20
+        ).grid(row=2, column=0, columnspan=2, pady=5)
 
-    # URL entry
-    url_frame = tk.Frame(settings_window)
-    url_frame.pack(fill="x", padx=20, pady=10)
+        tk.Frame(self.root, height=1, bg="gray").grid(row=3, column=0, columnspan=2, sticky="ew", padx=5)
 
-    tk.Label(url_frame, text="Webhook URL:").pack(side="left")
-    url_entry = tk.Entry(url_frame, width=50)
-    url_entry.pack(side="left", padx=10, fill="x", expand=True)
-    url_entry.insert(0, discord_webhook_url)
+        # 2. Action buttons (row 4)
+        btn_frame = tk.Frame(self.root)
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=5)
 
-    # Buttons
-    btn_frame = tk.Frame(settings_window)
-    btn_frame.pack(pady=15)
+        ttk.Button(
+            btn_frame,
+            text="Derslerimi Getir (API)",
+            command=self.open_course_selector,
+            width=22,
+            style="Green.TButton"
+        ).pack(pady=2)
 
-    def on_test():
-        url = url_entry.get().strip()
-        if not url:
-            messagebox.showwarning("Uyari", "Webhook URL'i giriniz!")
+        ttk.Button(
+            btn_frame,
+            text="Şimdi Derse Gir",
+            command=self.handle_manual_join,
+            width=22,
+            style="Blue.TButton"
+        ).pack(pady=2)
+
+        ttk.Button(
+            btn_frame,
+            text="Seçili Dersi Sil",
+            command=self.delete_selected_lesson,
+            width=22
+        ).pack(pady=2)
+
+        ttk.Button(
+            btn_frame,
+            text="Ayarlar (Webhook)",
+            command=self.open_settings_window,
+            width=22
+        ).pack(pady=2)
+
+        # 3. Status indicator (row 5)
+        self.status_label = tk.Label(self.root, text="● Scheduler aktif", anchor="w")
+        self.status_label.grid(row=5, column=0, columnspan=2, padx=10, pady=(8, 2), sticky="ew")
+
+        # 4. Lesson listbox (rows 6 & 7)
+        tk.Label(self.root, text="Kayıtlı Dersler:").grid(row=6, column=0, columnspan=2, pady=(10, 0))
+        self.lesson_listbox = tk.Listbox(self.root, width=42, height=10)
+        self.lesson_listbox.grid(row=7, column=0, columnspan=2, padx=5, pady=5)
+        self.lesson_mapping: List[Tuple[str, int]] = []
+
+        # 5. Version label (row 8)
+        tk.Label(
+            self.root,
+            text=f"{APP_VERSION} | Selenium-free, Hafif & Hızlı",
+            fg="gray",
+            font=("Arial", 8)
+        ).grid(row=8, column=0, columnspan=2)
+
+    # ── Credentials ──────────────────────────────────────────────────────────
+
+    def _load_saved_credentials(self) -> None:
+        username, password, _ = load_credentials()
+        if username:
+            self.username_entry.delete(0, tk.END)
+            self.username_entry.insert(0, username)
+        if password:
+            self.password_entry.delete(0, tk.END)
+            self.password_entry.insert(0, password)
+
+        if username and password:
+            self._get_or_create_session(username, password)
+
+    def save_user_credentials(self) -> None:
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+
+        if not username or not password:
+            self.show_warning("Uyarı", "Kullanıcı adı ve şifre boş olamaz!")
             return
 
-        if test_webhook(url):
-            messagebox.showinfo("Basarili", "Test bildirimi gonderildi!\nDiscord kanalinizi kontrol edin.")
+        save_credentials(username=username, password=password)
+        session = self._get_or_create_session(username, password)
+        session.reset_auth_lockout()
+        self.scheduler.reset_auth_lockout()
+        self.show_info("Bilgi", "Kullanıcı bilgileri kaydedildi ve hesap koruması sıfırlandı!")
+        logger.info(f"Credentials saved and lockout reset for: {username}")
+
+    def _get_or_create_session(self, username: str, password: str) -> YTUSessionManager:
+        if self.session_manager is None:
+            self.session_manager = YTUSessionManager(username, password)
         else:
-            messagebox.showerror("Hata", "Webhook testi basarisiz.\nURL'i kontrol edin.")
+            self.session_manager.update_credentials(username, password)
+        return self.session_manager
 
-    def on_save():
-        url = url_entry.get().strip()
-        save_webhook_url(url)
-        messagebox.showinfo("Bilgi", "Webhook ayarlari kaydedildi!")
-        settings_window.destroy()
+    # ── Settings Window ──────────────────────────────────────────────────────
 
-    def on_clear():
-        url_entry.delete(0, tk.END)
-        save_webhook_url("")
-        messagebox.showinfo("Bilgi", "Webhook devre disi birakildi.")
+    def open_settings_window(self) -> None:
+        current_url = load_webhook_url()
 
-    ttk.Button(btn_frame, text="Test Et", command=on_test, width=12).pack(side="left", padx=5)
-    ttk.Button(btn_frame, text="Kaydet", command=on_save, width=12).pack(side="left", padx=5)
-    ttk.Button(btn_frame, text="Temizle", command=on_clear, width=12).pack(side="left", padx=5)
-
-
-# ── Schedule Management ──────────────────────────────────────────────────────
-
-def load_schedule() -> dict:
-    """Load schedule from JSON file"""
-    try:
-        with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-def save_schedule(schedule: dict):
-    """Save schedule to JSON file"""
-    with open(SCHEDULE_FILE, "w", encoding="utf-8") as f:
-        json.dump(schedule, f, ensure_ascii=False, indent=2)
-
-
-def update_lesson_list():
-    """Update lesson listbox in GUI"""
-    global lesson_mapping
-    lesson_listbox.delete(0, tk.END)
-    lesson_mapping = []
-    schedule = load_schedule()
-
-    for day, lessons in schedule.items():
-        for idx, lesson in enumerate(lessons):
-            display_text = f"{day}: {lesson['hour']} - {lesson.get('desc', '')}"
-            lesson_listbox.insert(tk.END, display_text)
-            lesson_mapping.append((day, idx))
-
-
-def add_lesson():
-    """Add new lesson to schedule"""
-    day = day_var.get()
-    hour = hour_entry.get().strip()
-    desc = desc_entry.get().strip()
-
-    if not hour:
-        messagebox.showwarning("Uyarı", "Ders saatini giriniz!")
-        return
-
-    # Validate time format
-    try:
-        datetime.datetime.strptime(hour, "%H:%M")
-    except ValueError:
-        messagebox.showwarning("Uyarı", "Saat formatı HH:MM olmalıdır! (örn: 09:30)")
-        return
-
-    schedule = load_schedule()
-    schedule.setdefault(day, []).append({"hour": hour, "desc": desc})
-    save_schedule(schedule)
-
-    messagebox.showinfo("Bilgi", f"Ders eklendi: {day} günü saat {hour}")
-    logger.info(f"Lesson added: {day} {hour} - {desc}")
-    update_lesson_list()
-
-
-def delete_lesson():
-    """Delete selected lesson from schedule"""
-    selected = lesson_listbox.curselection()
-    if not selected:
-        messagebox.showwarning("Uyarı", "Silinecek dersi seçiniz!")
-        return
-
-    day, lesson_index = lesson_mapping[selected[0]]
-    schedule = load_schedule()
-
-    if day in schedule and lesson_index < len(schedule[day]):
-        deleted_lesson = schedule[day][lesson_index]
-        del schedule[day][lesson_index]
-        if not schedule[day]:
-            del schedule[day]
-        save_schedule(schedule)
-
-        messagebox.showinfo("Bilgi", "Ders silindi!")
-        logger.info(f"Lesson deleted: {day} {deleted_lesson['hour']}")
-        update_lesson_list()
-    else:
-        messagebox.showerror("Hata", "Ders bulunamadı!")
-
-
-# ── Course Selector (API-based) ─────────────────────────────────────────────
-
-def open_course_selector():
-    """
-    Login yap ve API'den dersleri çekip
-    checkbox listesi olarak kullanıcıya sun
-    """
-    global ytu_session, current_username, current_password
-
-    username = current_username or username_entry.get().strip()
-    password = current_password or password_entry.get().strip()
-
-    if not username or not password:
-        messagebox.showwarning("Uyarı", "Önce kullanıcı bilgilerini girin!")
-        return
-
-    # Progress dialog
-    progress_window = tk.Toplevel(root)
-    progress_window.title("Dersler Yükleniyor...")
-    progress_window.geometry("300x100")
-    progress_window.transient(root)
-    progress_window.grab_set()
-
-    progress_label = tk.Label(progress_window, text="Dersler API'den çekiliyor...\nLütfen bekleyin.")
-    progress_label.pack(expand=True)
-
-    root.update()
-
-    def fetch_courses():
-        global ytu_session
-
-        try:
-            # Session manager'ı initialize et veya mevcut olanı kullan
-            if not ytu_session or ytu_session.username != username:
-                ytu_session = YTUSessionManager(username, password)
-
-            courses = ytu_session.get_courses_safe()
-
-            # Progress'i kapat ve seçim penceresini aç
-            progress_window.destroy()
-
-            if not courses:
-                messagebox.showwarning("Uyarı", "Hiç ders bulunamadı!\n\nLogin bilgilerini kontrol edin.")
-                return
-
-            show_course_selection_dialog(courses)
-
-        except Exception as e:
-            progress_window.destroy()
-            messagebox.showerror("Hata", f"Dersler çekilemedi:\n{e}")
-            logger.error(f"Course fetch error: {e}")
-
-    # Arka planda çek (UI donmasın)
-    threading.Thread(target=fetch_courses, daemon=True).start()
-
-
-def show_course_selection_dialog(courses: list):
-    """
-    Checkbox listesi ile ders seçim penceresi
-    """
-    selector_window = tk.Toplevel(root)
-    selector_window.title("Ders Seçimi - YILDIZ")
-    selector_window.geometry("900x400")
-    selector_window.transient(root)
-
-    # Başlık
-    tk.Label(
-        selector_window,
-        text="Otomatik katılmak istediğiniz dersleri seçin:",
-        font=("Arial", 11, "bold")
-    ).pack(pady=10)
-
-    # Scrollable frame
-    canvas = tk.Canvas(selector_window)
-    scrollbar = tk.Scrollbar(selector_window, orient="vertical", command=canvas.yview)
-    scrollable_frame = tk.Frame(canvas)
-
-    scrollable_frame.bind(
-        "<Configure>",
-        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
-
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar.set)
-
-    canvas.pack(side="left", fill="both", expand=True, padx=10)
-    scrollbar.pack(side="right", fill="y")
-
-    # Checkbox'lar
-    course_vars = {}  # {program_no: (BooleanVar, course_data)}
-
-    for course in courses:
-        var = tk.BooleanVar(value=False)
-
-        # Checkbox + Label
-        frame = tk.Frame(scrollable_frame)
-        frame.pack(fill="x", pady=2)
-
-        cb = tk.Checkbutton(
-            frame,
-            variable=var,
-            anchor="w"
-        )
-        cb.pack(side="left")
-
-        label_text = f"{course['name']}"
-        if course.get('code'):
-            label_text = f"[{course['code']}] {label_text}"
+        settings_window = tk.Toplevel(self.root)
+        settings_window.title("Ayarlar - Discord Webhook")
+        settings_window.geometry("500x200")
+        settings_window.transient(self.root)
+        settings_window.grab_set()
 
         tk.Label(
-            frame,
-            text=label_text,
-            anchor="w",
-            wraplength=400
-        ).pack(side="left", fill="x")
+            settings_window,
+            text="Discord Webhook Ayarları",
+            font=("Arial", 12, "bold")
+        ).pack(pady=10)
 
-        course_vars[course['no']] = (var, course)
+        tk.Label(
+            settings_window,
+            text="Ders katılım bildirimlerini Discord'a göndermek için webhook URL'i girin.",
+            wraplength=450
+        ).pack(pady=5)
 
-    # Saat bilgisi için frame
-    time_frame = tk.LabelFrame(selector_window, text="Ders Saati Bilgisi", padx=10, pady=5)
-    time_frame.pack(fill="x", padx=10, pady=10)
+        url_frame = tk.Frame(settings_window)
+        url_frame.pack(fill="x", padx=20, pady=10)
 
-    tk.Label(time_frame, text="Saatler API'den otomatik çekilecek.").pack()
-    tk.Label(time_frame, text="Bulunamazsa manuel giriş istenir.").pack()
+        tk.Label(url_frame, text="Webhook URL:").pack(side="left")
+        url_entry = tk.Entry(url_frame, width=50)
+        url_entry.pack(side="left", padx=10, fill="x", expand=True)
+        url_entry.insert(0, current_url)
 
-    # Butonlar
-    button_frame = tk.Frame(selector_window)
-    button_frame.pack(pady=10)
+        btn_frame = tk.Frame(settings_window)
+        btn_frame.pack(pady=15)
 
-    def on_add_selected():
-        """Seçili dersleri schedule'a ekle - önce API'den saat çek"""
-        global ytu_session
-
-        selected = [(no, data) for no, (var, data) in course_vars.items() if var.get()]
-
-        if not selected:
-            messagebox.showwarning("Uyarı", "Hiç ders seçilmedi!")
-            return
-
-        # Her seçili ders için saatleri çek ve ekle
-        added_count = 0
-        manual_count = 0
-
-        for program_no, course_data in selected:
-            # API'den ders saatlerini çek
-            schedules = []
-            if ytu_session:
-                schedules = ytu_session.get_course_schedule_safe(program_no)
-
-            if schedules:
-                # Saatler bulundu - otomatik ekle
-                schedule = load_schedule()
-                for sched in schedules:
-                    day = sched['day']
-                    hour = sched['start_time']
-
-                    # Aynı ders aynı saatte varsa ekleme
-                    existing = schedule.get(day, [])
-                    if any(l['hour'] == hour and l.get('desc', '') == course_data['name'] for l in existing):
-                        continue
-
-                    schedule.setdefault(day, []).append({
-                        "hour": hour,
-                        "desc": course_data['name'],
-                        "program_no": program_no
-                    })
-                    logger.info(f"Auto-added: {day} {hour} - {course_data['name']}")
-                    added_count += 1
-                save_schedule(schedule)
+        def on_test():
+            url = url_entry.get().strip()
+            if not url:
+                messagebox.showwarning("Uyarı", "Webhook URL'i giriniz!")
+                return
+            if test_webhook(url):
+                messagebox.showinfo("Başarılı", "Test bildirimi gönderildi!\nDiscord kanalınızı kontrol edin.")
             else:
-                # Saatler bulunamadı - manuel giriş
-                add_course_with_time_dialog(course_data)
-                manual_count += 1
+                messagebox.showerror("Hata", "Webhook testi başarısız.\nURL'i kontrol edin.")
 
-        selector_window.destroy()
-        update_lesson_list()
+        def on_save():
+            url = url_entry.get().strip()
+            save_webhook_url(url)
+            messagebox.showinfo("Bilgi", "Webhook ayarları kaydedildi!")
+            settings_window.destroy()
 
-        # Sonucu göster
-        if added_count > 0 and manual_count == 0:
-            messagebox.showinfo("Başarılı", f"{added_count} ders saati otomatik eklendi!")
-        elif added_count > 0 and manual_count > 0:
-            messagebox.showinfo("Bilgi", f"{added_count} ders otomatik, {manual_count} ders manuel eklendi.")
+        def on_clear():
+            url_entry.delete(0, tk.END)
+            save_webhook_url("")
+            messagebox.showinfo("Bilgi", "Webhook devre dışı bırakıldı.")
 
-    ttk.Button(
-        button_frame,
-        text="Seçilenleri Ekle",
-        command=on_add_selected,
-        width=15
-    ).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Test Et", command=on_test, width=12).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Kaydet", command=on_save, width=12).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Temizle", command=on_clear, width=12).pack(side="left", padx=5)
 
-    ttk.Button(
-        button_frame,
-        text="İptal",
-        command=selector_window.destroy,
-        width=15
-    ).pack(side="left", padx=5)
+    # ── Lesson Management ────────────────────────────────────────────────────
 
-
-def add_course_with_time_dialog(course_data: dict):
-    """
-    Tek bir ders için gün ve saat seçimi dialog'u
-    """
-    dialog = tk.Toplevel(root)
-    dialog.title(f"Saat Seçimi: {course_data['name'][:30]}...")
-    dialog.geometry("350x200")
-    dialog.transient(root)
-    dialog.grab_set()
-
-    tk.Label(
-        dialog,
-        text=f"Ders: {course_data['name']}",
-        font=("Arial", 10, "bold"),
-        wraplength=320
-    ).pack(pady=10)
-
-    # Gün seçimi
-    day_frame = tk.Frame(dialog)
-    day_frame.pack(fill="x", padx=20, pady=5)
-
-    tk.Label(day_frame, text="Gün:").pack(side="left")
-    day_var_dialog = tk.StringVar(value="Monday")
-    day_menu = tk.OptionMenu(
-        day_frame, day_var_dialog,
-        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"
-    )
-    day_menu.pack(side="left", padx=10)
-
-    # Saat girişi
-    time_frame = tk.Frame(dialog)
-    time_frame.pack(fill="x", padx=20, pady=5)
-
-    tk.Label(time_frame, text="Saat (HH:MM):").pack(side="left")
-    time_entry = tk.Entry(time_frame, width=10)
-    time_entry.pack(side="left", padx=10)
-    time_entry.insert(0, "09:00")
-
-    result = {'saved': False}
-
-    def on_save():
-        hour = time_entry.get().strip()
-        day = day_var_dialog.get()
-
-        # Saat format kontrolü
-        try:
-            datetime.datetime.strptime(hour, "%H:%M")
-        except ValueError:
-            messagebox.showwarning("Uyarı", "Saat formatı HH:MM olmalı!")
-            return
-
-        # Schedule'a ekle
+    def refresh_lesson_list(self) -> None:
+        self.lesson_listbox.delete(0, tk.END)
+        self.lesson_mapping = []
         schedule = load_schedule()
-        schedule.setdefault(day, []).append({
-            "hour": hour,
-            "desc": course_data['name'],
-            "program_no": course_data['no']
-        })
-        save_schedule(schedule)
 
-        logger.info(f"Course added: {day} {hour} - {course_data['name']}")
-        result['saved'] = True
-        dialog.destroy()
+        for day in DAYS_CANONICAL:
+            lessons = schedule.get(day, [])
+            display_day = get_day_display_name(day)
+            for idx, lesson in enumerate(lessons):
+                text = f"{display_day}: {lesson['hour']} - {lesson.get('desc', '')}"
+                self.lesson_listbox.insert(tk.END, text)
+                self.lesson_mapping.append((day, idx))
 
-    def on_skip():
-        dialog.destroy()
+        if hasattr(self, "_update_status"):
+            self._update_status()
 
-    button_frame = tk.Frame(dialog)
-    button_frame.pack(pady=15)
+    def _update_status(self) -> None:
+        """Periodic status indicator update running on Tk main thread."""
+        if self._status_after_id:
+            try:
+                self.root.after_cancel(self._status_after_id)
+            except Exception:
+                pass
+            self._status_after_id = None
 
-    tk.Button(button_frame, text="Kaydet", command=on_save, width=10).pack(side="left", padx=5)
-    tk.Button(button_frame, text="Atla", command=on_skip, width=10).pack(side="left", padx=5)
-
-    dialog.wait_window()
-    return result['saved']
-
-
-# ── Automation Core (Pure Terminal - no Selenium!) ───────────────────────────
-
-
-def get_current_lesson() -> tuple[str, str] | None:
-    """
-    Find the current or upcoming lesson within tolerance.
-
-    Returns:
-        tuple (course_name, hour) if a lesson is found within tolerance:
-        - 15 minutes before class start
-        - 60 minutes after class starts
-        None if no matching lesson
-    """
-    now = datetime.datetime.now()
-    current_day = now.strftime("%A")
-    schedule = load_schedule()
-
-    if current_day not in schedule:
-        return None
-
-    best_match = None
-    min_diff = float('inf')
-
-    for lesson in schedule[current_day]:
-        lesson_time = datetime.datetime.strptime(lesson["hour"], "%H:%M").replace(
-            year=now.year, month=now.month, day=now.day
-        )
-        # Time until lesson starts (negative = lesson in the future)
-        time_until_lesson = (lesson_time - now).total_seconds()
-
-        # Valid window: 60 min after to 15 min before class starts
-        if -MANUAL_JOIN_AFTER <= time_until_lesson <= MANUAL_JOIN_BEFORE:
-            # Use absolute time in window for best match
-            abs_diff = abs(time_until_lesson)
-            if abs_diff < min_diff:
-                min_diff = abs_diff
-                best_match = (lesson.get('desc', ''), lesson['hour'])
-
-    return best_match
-
-
-def handle_manual_join():
-    """
-    Handler for "Şimdi Derse Gir" button.
-    Checks schedule before joining to prevent wrong class entry.
-    Tolerance: 15 minutes before to 60 minutes after class starts.
-    """
-    lesson = get_current_lesson()
-
-    if lesson is None:
-        messagebox.showwarning(
-            "Uyarı",
-            "Uygun ders bulunamadı!\n\n"
-            "Tolerans: Dersten 15 dakika önce ~ Dersten 60 dakika sonrası\n"
-            "Lütfen ders programınızı kontrol edin."
-        )
-        logger.warning("[MANUAL] No scheduled lesson found within tolerance")
-        return
-
-    course_name, hour = lesson
-    logger.info(f"[MANUAL] Found scheduled lesson: {course_name} at {hour}")
-
-    # Start automation with found course name
-    threading.Thread(target=run_automation, args=(course_name,), daemon=True).start()
-
-
-def run_automation(course_name: str = None):
-    """
-    Pure Terminal automation - Join class without Selenium
-
-    Args:
-        course_name: Optional course name to filter (from scheduler)
-                    If None, will join first available class
-
-    Flow:
-    1. Ensure logged into YTU Online (uses cached session if available)
-    2. Call AttendLessonProgram API to get Zoom link
-    3. Launch Zoom using platform-specific protocol handler
-    """
-    global ytu_session
-
-    username = current_username
-    password = current_password
-
-    if not username or not password:
-        messagebox.showwarning("Uyarı", "Lütfen önce kullanıcı bilgilerini girin ve kaydedin!")
-        return
-
-    logger.info("=== Automation started ===")
-    if course_name:
-        logger.info(f"Target course: {course_name}")
-
-    try:
-        # Initialize session manager (lazy init)
-        if not ytu_session or ytu_session.username != username:
-            logger.info("Initializing YTU session manager...")
-            ytu_session = YTUSessionManager(username, password)
-
-        # Step 1: Ensure logged in
-        logger.info("Step 1: Checking login status...")
-        if not ytu_session.ensure_logged_in():
-            messagebox.showerror("Hata", "Login başarısız! Kullanıcı adı/şifre kontrol edin.")
-            logger.error("Login failed")
-            return
-
-        # Step 2: Get Zoom link (with optional course filter)
-        logger.info("Step 2: Getting Zoom link from API...")
-        zoom_url = ytu_session.get_zoom_link_safe(course_name)
-
-        if not zoom_url:
-            messagebox.showwarning("Uyarı", "Aktif ders bulunamadı veya Zoom linki çıkarılamadı.\n\nDers saatinde olduğunuzdan emin olun.")
-            logger.warning("No Zoom link found")
-            notify_no_link_found(discord_webhook_url, course_name)
-            return
-
-        # Step 3: Open Zoom
-        logger.info(f"Step 3: Opening Zoom... {zoom_url[:60]}...")
-        success = open_zoom_link(zoom_url)
-
-        if success:
-            messagebox.showinfo("Başarılı", "Zoom uygulaması açıldı!\n\nLütfen Zoom'da 'Join' butonuna tıklayın.")
-            logger.info("✓ Automation completed successfully")
-            notify_lesson_joined(discord_webhook_url, course_name or "Bilinmeyen Ders")
-        else:
-            messagebox.showerror("Hata", "Zoom linki açılamadı. Zoom uygulaması yüklü mü?")
-            logger.error("Failed to open Zoom")
-            notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", "Zoom acilamadi")
-
-    except YTUClientException as e:
-        messagebox.showerror("Hata", f"Otomasyon başarısız:\n{e}")
-        logger.error(f"Automation error: {e}")
-        notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", str(e))
-    except Exception as e:
-        messagebox.showerror("Hata", f"Beklenmeyen hata:\n{e}")
-        logger.error(f"Unexpected error: {e}", exc_info=True)
-        notify_lesson_failed(discord_webhook_url, course_name or "Bilinmeyen Ders", str(e))
-
-
-# ── Scheduler ────────────────────────────────────────────────────────────────
-
-def check_schedule():
-    """
-    Background scheduler - monitors schedule and triggers automation
-
-    Runs in daemon thread, checks every CHECK_INTERVAL seconds
-    """
-    logger.info(f"Scheduler started (check interval: {CHECK_INTERVAL}s, tolerance: ±{JOIN_TOLERANCE}s)")
-
-    while True:
         try:
-            now = datetime.datetime.now()
-            current_day = now.strftime("%A")
-            schedule = load_schedule()
+            is_active = bool(self.scheduler and self.scheduler.is_running)
+            status_prefix = "● Scheduler aktif" if is_active else "○ Scheduler durdu"
 
-            if current_day in schedule:
-                for lesson in schedule[current_day]:
-                    lesson_key = f"{current_day}-{lesson['hour']}"
+            next_lesson = self.scheduler.get_next_lesson() if self.scheduler else None
+            if not next_lesson:
+                status_text = f"{status_prefix} · Program boş — 'Derslerimi Getir' ile ekle"
+            else:
+                desc = next_lesson.get("desc", "")
+                hour = next_lesson.get("hour", "")
+                day_label = next_lesson.get("day_label", "")
+                is_now = next_lesson.get("is_now", False)
+                delta_sec = next_lesson.get("delta_seconds", 0)
 
-                    # Prevent duplicate joins
-                    if lesson_key in joined_lessons:
-                        continue
+                if is_now:
+                    detail = f"Devam ediyor: {desc} · {hour}"
+                else:
+                    time_str = format_delta_time(delta_sec)
+                    if day_label == "bugün":
+                        detail = f"Sıradaki: {desc} · {hour} ({time_str})"
+                    elif day_label == "yarın":
+                        detail = f"Sıradaki: {desc} · yarın {hour} ({time_str})"
+                    else:
+                        detail = f"Sıradaki: {desc} · {day_label} {hour} ({time_str})"
 
-                    # Time comparison with tolerance
-                    lesson_time = datetime.datetime.strptime(lesson["hour"], "%H:%M").replace(
-                        year=now.year, month=now.month, day=now.day
-                    )
-                    diff = abs((now - lesson_time).total_seconds())
+                status_text = f"{status_prefix} · {detail}"
 
-                    if diff <= JOIN_TOLERANCE:
-                        course_name = lesson.get('desc', '')
-                        hour = lesson['hour']
-                        logger.info(f"[SCHEDULER] Time to join: {lesson_key} - {course_name} (diff: {diff:.0f}s)")
-                        joined_lessons.add(lesson_key)
-
-                        # Send Discord notification
-                        notify_scheduler_triggered(discord_webhook_url, course_name, hour)
-
-                        # Start automation in background thread with course name
-                        threading.Thread(
-                            target=run_automation,
-                            args=(course_name,),
-                            daemon=True
-                        ).start()
-                        break
-
+            if hasattr(self, "status_label"):
+                self.status_label.config(text=status_text)
         except Exception as e:
-            logger.error(f"Scheduler error: {e}", exc_info=True)
+            logger.debug(f"Status update error: {e}")
+        finally:
+            self._status_after_id = self.root.after(30000, self._update_status)
 
-        time.sleep(CHECK_INTERVAL)
+    def delete_selected_lesson(self) -> None:
+        selected = self.lesson_listbox.curselection()
+        if not selected:
+            self.show_warning("Uyarı", "Silinecek dersi seçiniz!")
+            return
+
+        day, idx = self.lesson_mapping[selected[0]]
+        deleted = store_delete_lesson(day, idx)
+        if deleted:
+            self.show_info("Bilgi", "Ders silindi!")
+            self.refresh_lesson_list()
+        else:
+            self.show_error("Hata", "Ders bulunamadı veya silinemedi!")
+
+    # ── Course Selector (LMS API) ────────────────────────────────────────────
+
+    def open_course_selector(self) -> None:
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+
+        if not username or not password:
+            self.show_warning("Uyarı", "Önce kullanıcı bilgilerini girin!")
+            return
+
+        session = self._get_or_create_session(username, password)
+
+        # Progress window on main thread
+        progress_window = tk.Toplevel(self.root)
+        progress_window.title("Dersler Yükleniyor...")
+        progress_window.geometry("300x100")
+        progress_window.transient(self.root)
+        progress_window.grab_set()
+
+        progress_label = tk.Label(progress_window, text="Dersler API'den çekiliyor...\nLütfen bekleyin.")
+        progress_label.pack(expand=True)
+
+        def fetch_worker():
+            try:
+                courses = session.get_courses_safe()
+
+                def on_done():
+                    progress_window.destroy()
+                    if not courses:
+                        messagebox.showwarning(
+                            "Uyarı",
+                            "Hiç ders bulunamadı!\n\nKullanıcı adı ve şifrenizi kontrol edin."
+                        )
+                        return
+                    self._show_course_selection_dialog(courses)
+
+                self.ui_call(on_done)
+
+            except Exception as e:
+                def on_fail():
+                    progress_window.destroy()
+                    messagebox.showerror("Hata", f"Dersler çekilemedi:\n{e}")
+
+                self.ui_call(on_fail)
+
+        threading.Thread(target=fetch_worker, daemon=True).start()
+
+    def _show_course_selection_dialog(self, courses: List[Dict]) -> None:
+        selector_window = tk.Toplevel(self.root)
+        selector_window.title("Ders Seçimi - YILDIZ")
+        selector_window.geometry("700x450")
+        selector_window.transient(self.root)
+        selector_window.grab_set()
+
+        tk.Label(
+            selector_window,
+            text="Otomatik katılmak istediğiniz dersleri seçin:",
+            font=("Arial", 11, "bold")
+        ).pack(pady=10)
+
+        # Scrollable container
+        canvas = tk.Canvas(selector_window)
+        scrollbar = tk.Scrollbar(selector_window, orient="vertical", command=canvas.yview)
+        scrollable_frame = tk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True, padx=10)
+        scrollbar.pack(side="right", fill="y")
+
+        course_vars: Dict[str, Tuple[tk.BooleanVar, Dict]] = {}
+
+        for course in courses:
+            var = tk.BooleanVar(value=False)
+            frame = tk.Frame(scrollable_frame)
+            frame.pack(fill="x", pady=2)
+
+            cb = tk.Checkbutton(frame, variable=var, anchor="w")
+            cb.pack(side="left")
+
+            label_text = course['name']
+            if course.get('code'):
+                label_text = f"[{course['code']}] {label_text}"
+            if course.get('instructor'):
+                label_text += f" ({course['instructor']})"
+
+            tk.Label(frame, text=label_text, anchor="w", wraplength=550).pack(side="left", fill="x")
+            course_vars[course['no']] = (var, course)
+
+        btn_frame = tk.Frame(selector_window)
+        btn_frame.pack(pady=10)
+
+        def on_add_selected():
+            selected = [data for var, data in course_vars.values() if var.get()]
+            if not selected:
+                messagebox.showwarning("Uyarı", "Hiç ders seçilmedi!")
+                return
+
+            selector_window.destroy()
+            self._fetch_and_add_schedules_async(selected)
+
+        ttk.Button(btn_frame, text="Seçilenleri Ekle", command=on_add_selected, width=15).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="İptal", command=selector_window.destroy, width=15).pack(side="left", padx=5)
+
+    def _fetch_and_add_schedules_async(self, selected_courses: List[Dict]) -> None:
+        """
+        Background worker to fetch schedules for selected courses
+        without blocking the UI.
+        """
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+        session = self._get_or_create_session(username, password)
+
+        # Show modal progress
+        progress_dialog = tk.Toplevel(self.root)
+        progress_dialog.title("Program Alınıyor...")
+        progress_dialog.geometry("350x120")
+        progress_dialog.transient(self.root)
+        progress_dialog.grab_set()
+
+        status_label = tk.Label(progress_dialog, text="Ders saatleri API'den alınıyor...")
+        status_label.pack(expand=True, pady=10)
+
+        def worker():
+            added_count = 0
+            schedule_dict = load_schedule()
+
+            for course_data in selected_courses:
+                prog_no = course_data['no']
+                schedules = session.get_course_schedule_safe(prog_no)
+
+                if schedules:
+                    for s in schedules:
+                        day = s['day']
+                        hour = s['start_time']
+                        # Avoid duplicates
+                        existing = schedule_dict.get(day, [])
+                        if any(l['hour'] == hour and l.get('desc') == course_data['name'] for l in existing):
+                            continue
+
+                        schedule_dict.setdefault(day, []).append({
+                            "hour": hour,
+                            "desc": course_data['name'],
+                            "program_no": prog_no
+                        })
+                        added_count += 1
+                else:
+                    # If schedule not found, add default slot or allow manual edit
+                    day = "Monday"
+                    schedule_dict.setdefault(day, []).append({
+                        "hour": "09:00",
+                        "desc": course_data['name'],
+                        "program_no": prog_no
+                    })
+                    added_count += 1
+
+            save_schedule(schedule_dict)
+
+            def on_finish():
+                progress_dialog.destroy()
+                self.refresh_lesson_list()
+                messagebox.showinfo("Başarılı", f"{added_count} ders saati başarıyla eklendi!")
+
+            self.ui_call(on_finish)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Automation Logic ─────────────────────────────────────────────────────
+
+    def get_current_lesson(self) -> Optional[Tuple[str, str, Optional[str]]]:
+        """
+        Finds scheduled lesson within manual join window
+        (15m before to 60m after).
+        Returns (course_name, hour, program_no) or None.
+        Python 3.8 compatible return typing.
+        """
+        now = datetime.datetime.now()
+        current_day = get_current_day(now)
+        schedule = load_schedule()
+
+        if current_day not in schedule:
+            return None
+
+        best_match = None
+        min_diff = float('inf')
+
+        for lesson in schedule[current_day]:
+            try:
+                h, m = map(int, lesson["hour"].split(":"))
+                lesson_time = now.replace(hour=h, minute=m, second=0, microsecond=0)
+            except Exception:
+                continue
+
+            time_until_lesson = (lesson_time - now).total_seconds()
+
+            # Window: 60m after to 15m before class starts
+            if -MANUAL_JOIN_AFTER <= time_until_lesson <= MANUAL_JOIN_BEFORE:
+                abs_diff = abs(time_until_lesson)
+                if abs_diff < min_diff:
+                    min_diff = abs_diff
+                    best_match = (
+                        lesson.get('desc', ''),
+                        lesson.get('hour', ''),
+                        lesson.get('program_no')
+                    )
+
+        return best_match
+
+    def handle_manual_join(self) -> None:
+        """Handler for 'Şimdi Derse Gir' button."""
+        lesson = self.get_current_lesson()
+        if lesson is None:
+            self.show_warning(
+                "Uyarı",
+                "Şu an için uygun bir ders bulunamadı!\n\n"
+                "Tolerans Penceresi: Dersten 15 dk önce ~ Dersten 60 dk sonra.\n"
+                "Lütfen ders programınızı kontrol edin."
+            )
+            return
+
+        course_name, hour, program_no = lesson
+        logger.info(f"[MANUAL] Triggering join for: {course_name} ({hour}, program_no: {program_no})")
+
+        threading.Thread(
+            target=self.run_automation_flow,
+            args=(course_name, program_no, hour, True),
+            daemon=True
+        ).start()
+
+    def run_automation_flow(
+        self,
+        course_name: str,
+        program_no: Optional[str] = None,
+        hour: Optional[str] = None,
+        is_manual: bool = False
+    ) -> JoinResult:
+        """
+        Core join execution flow.
+        Acquires automation lock to prevent duplicate concurrent launches.
+        Returns JoinResult with status.
+        """
+        username = self.username_entry.get().strip()
+        password = self.password_entry.get()
+        webhook_url = load_webhook_url()
+
+        if not username or not password:
+            if is_manual:
+                self.show_warning("Uyarı", "Lütfen önce kullanıcı bilgilerinizi kaydedin!")
+            return JoinResult(success=False, status="AUTH_FAILED", message="Kullanıcı bilgileri eksik")
+
+        with self._automation_lock:
+            try:
+                session = self._get_or_create_session(username, password)
+
+                if not session.ensure_logged_in():
+                    if is_manual:
+                        self.show_error("Hata", "Giriş başarısız! Kullanıcı adı veya şifrenizi kontrol edin.")
+                        notify_auth_failed(webhook_url, course_name, hour)
+                    return JoinResult(success=False, status="AUTH_FAILED", message="Giriş başarısız")
+
+                # Extract Zoom link
+                zoom_url = session.get_zoom_link_safe(
+                    course_name=course_name,
+                    program_no=program_no
+                )
+
+                if not zoom_url:
+                    if is_manual:
+                        self.show_warning(
+                            "Uyarı",
+                            "Aktif ders bulunamadı veya Zoom linki henüz açılmadı.\n\n"
+                            "Hocanın toplantıyı başlattığından emin olun."
+                        )
+                        notify_no_link_found(webhook_url, course_name)
+                    # For automated scheduler retry: SILENT! Zero Discord spam!
+                    return JoinResult(success=False, status="LINK_NOT_FOUND", message="Link henüz açılmadı")
+
+                # Launch Zoom via protocol handler / browser
+                opened = open_zoom_link(zoom_url)
+                if opened:
+                    if hasattr(self, "scheduler") and self.scheduler:
+                        try:
+                            self.scheduler.record_joined_lesson({
+                                "desc": course_name,
+                                "program_no": program_no,
+                                "hour": hour or "",
+                            })
+                        except Exception as e:
+                            logger.warning(f"Could not record joined lesson in scheduler history: {e}")
+
+                    if is_manual:
+                        self.show_info(
+                            "Başarılı",
+                            f"Zoom açıldı!\n\nDers: {course_name}\nLütfen Zoom ekranını kontrol edin."
+                        )
+                    notify_lesson_joined(webhook_url, course_name, hour)
+                    return JoinResult(success=True, status="SUCCESS", message="Zoom açıldı")
+                else:
+                    if is_manual:
+                        self.show_error("Hata", "Zoom linki açılamadı. Zoom yüklü mü?")
+                    notify_lesson_failed(webhook_url, course_name, "Zoom açılamadı", hour)
+                    return JoinResult(success=False, status="ERROR", message="Zoom açılamadı")
+
+            except Exception as e:
+                logger.error(f"Automation execution failed: {e}", exc_info=True)
+                if is_manual:
+                    self.show_error("Hata", f"Otomasyon hatası:\n{e}")
+                notify_lesson_failed(webhook_url, course_name, str(e), hour)
+                return JoinResult(success=False, status="ERROR", message=str(e))
+
+    def _scheduler_join_callback(self, lesson: Dict) -> JoinResult:
+        """Invoked by background LessonScheduler."""
+        course_name = lesson.get("desc", "")
+        program_no = lesson.get("program_no")
+        hour = lesson.get("hour", "")
+        return self.run_automation_flow(
+            course_name=course_name,
+            program_no=program_no,
+            hour=hour,
+            is_manual=False
+        )
+
+    def _on_notify_waiting(self, course_name: str, hour: str) -> None:
+        webhook_url = load_webhook_url()
+        if webhook_url:
+            notify_waiting_for_link(webhook_url, course_name, hour)
+
+    def _on_notify_still_waiting(self, course_name: str, hour: str, minutes_elapsed: int) -> None:
+        webhook_url = load_webhook_url()
+        if webhook_url:
+            notify_still_waiting_for_link(webhook_url, course_name, hour, minutes_elapsed)
+
+    def _on_notify_missed(self, course_name: str, hour: str, reason: str) -> None:
+        webhook_url = load_webhook_url()
+        if webhook_url:
+            notify_lesson_missed(webhook_url, course_name, hour, reason)
+
+    def _on_notify_auth_failed(self, course_name: str, hour: str) -> None:
+        webhook_url = load_webhook_url()
+        if webhook_url:
+            notify_auth_failed(webhook_url, course_name, hour)
+
+    def _on_auth_failed_alert(self) -> None:
+        self.show_error(
+            "Giriş Başarısız (Hesap Koruması)",
+            "Giriş bilgileri doğrulanamadı.\n\n"
+            "Üniversite hesabınızın kilitlenmesini önlemek için otomatik denemeler durduruldu.\n"
+            "Lütfen bilgilerinizi kontrol edip 'Bilgileri Kaydet' butonuyla güncelleyin."
+        )
+
+    def on_close(self) -> None:
+        """Gracefully shuts down scheduler, cancels status timers, and closes UI."""
+        logger.info("Application closing...")
+        if self._status_after_id:
+            try:
+                self.root.after_cancel(self._status_after_id)
+            except Exception:
+                pass
+            self._status_after_id = None
+        try:
+            self.scheduler.stop()
+        except Exception:
+            pass
+        self.root.destroy()
 
 
-# ── GUI Setup ────────────────────────────────────────────────────────────────
+def main() -> None:
+    setup_logging()
+    root = tk.Tk()
+    app = AutomationApp(root)
+    root.mainloop()
 
-root = tk.Tk()
-root.title("YILDIZ Ders Otomasyonu v1.0")
-root.resizable(False, False)
 
-# Configure ttk styles for colored buttons (macOS compatible)
-style = ttk.Style()
-style.configure("Green.TButton", font=("Arial", 10))
-style.configure("Blue.TButton", font=("Arial", 10))
-
-# Credentials section
-tk.Label(root, text="Okul Maili:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
-username_entry = tk.Entry(root, width=25)
-username_entry.grid(row=0, column=1, padx=5, pady=5)
-
-tk.Label(root, text="Şifre:").grid(row=1, column=0, padx=5, pady=5, sticky="e")
-password_entry = tk.Entry(root, show="*", width=25)
-password_entry.grid(row=1, column=1, padx=5, pady=5)
-
-tk.Button(root, text="Bilgileri Kaydet", command=save_credentials, width=20).grid(
-    row=2, column=0, columnspan=2, pady=5
-)
-
-tk.Frame(root, height=1, bg="gray").grid(row=3, column=0, columnspan=2, sticky="ew", padx=5)
-
-# Lesson management section
-tk.Label(root, text="Gün:").grid(row=4, column=0, padx=5, pady=5, sticky="e")
-day_var = tk.StringVar(root, value="Monday")
-tk.OptionMenu(root, day_var,
-              "Monday", "Tuesday", "Wednesday", "Thursday",
-              "Friday", "Saturday", "Sunday").grid(row=4, column=1, padx=5, pady=5, sticky="w")
-
-tk.Label(root, text="Saat (HH:MM):").grid(row=5, column=0, padx=5, pady=5, sticky="e")
-hour_entry = tk.Entry(root, width=10)
-hour_entry.grid(row=5, column=1, padx=5, pady=5, sticky="w")
-
-tk.Label(root, text="Ders Adı:").grid(row=6, column=0, padx=5, pady=5, sticky="e")
-desc_entry = tk.Entry(root, width=25)
-desc_entry.grid(row=6, column=1, padx=5, pady=5)
-
-tk.Button(root, text="Ders Ekle", command=add_lesson, width=20).grid(
-    row=7, column=0, columnspan=2, pady=5
-)
-
-tk.Frame(root, height=1, bg="gray").grid(row=8, column=0, columnspan=2, sticky="ew", padx=5)
-
-# Action buttons
-btn_frame = tk.Frame(root)
-btn_frame.grid(row=9, column=0, columnspan=2, pady=5)
-
-ttk.Button(
-    btn_frame,
-    text="Derslerimi Getir (API)",
-    command=open_course_selector,
-    width=22,
-    style="Green.TButton"
-).pack(pady=2)
-
-ttk.Button(
-    btn_frame,
-    text="Şimdi Derse Gir",
-    command=handle_manual_join,
-    width=22,
-    style="Blue.TButton"
-).pack(pady=2)
-
-ttk.Button(btn_frame, text="Seçili Dersi Sil", command=delete_lesson, width=22).pack(pady=2)
-
-ttk.Button(btn_frame, text="Ayarlar (Webhook)", command=open_settings_window, width=22).pack(pady=2)
-
-# Lesson list
-tk.Label(root, text="Kayıtlı Dersler:").grid(row=10, column=0, columnspan=2, pady=(10, 0))
-lesson_listbox = tk.Listbox(root, width=40, height=10)
-lesson_listbox.grid(row=11, column=0, columnspan=2, padx=5, pady=5)
-
-# Version info
-tk.Label(
-    root,
-    text="v1.0 | Selenium-free, Hafif & Hızlı",
-    fg="gray",
-    font=("Arial", 8)
-).grid(row=12, column=0, columnspan=2)
-
-# ── Startup ──────────────────────────────────────────────────────────────────
-
-logger.info("=== YILDIZ Ders Otomasyonu v1.0 ===")
-logger.info("Mode: Selenium-free, API-based")
-
-load_credentials()
-load_webhook_url()
-update_lesson_list()
-
-# Start scheduler thread
-threading.Thread(target=check_schedule, daemon=True).start()
-
-logger.info("Ready. Monitoring schedule...")
-print("\n" + "="*50)
-print("YILDIZ Ders Otomasyonu v1.0")
-print("="*50)
-print("✓ Selenium-free, Tarayıcı gerektirmez")
-print("✓ Hafif & Hızlı")
-print("✓ Zoom direkt protokol ile açılır")
-print("="*50 + "\n")
-
-root.mainloop()
+if __name__ == "__main__":
+    main()
